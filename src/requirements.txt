@@ -1,0 +1,8 @@
+torch
+lightning
+transformers
+pandas
+torch
+torchvision
+jsonargparse
+fastparquet

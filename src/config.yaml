@@ -1,0 +1,26 @@
+model:
+  embed_dim: 512
+  image_resolution: 224
+  vision_layers: [3, 4, 6, 3]
+  vision_width: 64
+  vision_patch_size: 32
+  in_channels: 3
+  context_length: 256
+  transformer_width: 512
+  transformer_heads: 8
+  transformer_layers: 12
+  learning_rate: 5e-4
+  weight_decay: 0.1
+  warmup_steps: 2000
+  tokenizer_name: "openai/clip-vit-base-patch32"
+
+data:
+  parquet_path: "E:/Data/query-earth/git-10mil/git_10m_1000000_random.parquet"
+  batch_size: 64
+  num_workers: 4
+  image_resolution: 224
+  val_fraction: 0.1
+
+trainer:
+  max_epochs: 32
+  accumulate_grad_batches: 16
