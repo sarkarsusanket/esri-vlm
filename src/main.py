@@ -5,6 +5,7 @@ from typing import List
 import lightning.pytorch as pl
 import torch
 from lightning.pytorch.cli import LightningCLI
+from lightning.pytorch.loggers import CSVLogger, LoggerCollection
 from transformers import CLIPTokenizer, CLIPTextModel
 
 from model import CLIP
@@ -154,9 +155,16 @@ def cli_main(default_config_filename="./configs/default.yaml"):
 
     ts = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     run_name = f"CLIP_{ts}"
+
+    csv_logger = CSVLogger(cli.trainer.default_root_dir, name=run_name)
+
     if cli.trainer.logger is not None:
-        cli.trainer.logger.experiment.name = run_name
-        cli.trainer.logger.log_hyperparams(cli.datamodule.hparams)
+        existing_logger = cli.trainer.logger
+        cli.trainer.logger = LoggerCollection([existing_logger, csv_logger])
+        existing_logger.experiment.name = run_name
+        existing_logger.log_hyperparams(cli.datamodule.hparams)
+    else:
+        cli.trainer.logger = csv_logger
 
     dirname_cfg = Path(default_config_filename).parent
     dir_log_cfg = Path(cli.trainer.log_dir) / dirname_cfg
