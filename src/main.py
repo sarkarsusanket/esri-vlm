@@ -1,3 +1,4 @@
+import csv
 from datetime import datetime
 from pathlib import Path
 from typing import List
@@ -5,7 +6,7 @@ from typing import List
 import lightning.pytorch as pl
 import torch
 from lightning.pytorch.cli import LightningCLI
-from lightning.pytorch.loggers import CSVLogger, LoggerCollection
+from lightning.pytorch.callbacks import Callback
 from transformers import CLIPTokenizer, CLIPTextModel
 
 from model import CLIP
@@ -83,12 +84,12 @@ class CLIPLightningModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         loss = self.common_step(batch, batch_idx)
-        self.log("train_loss", loss, prog_bar=True)
+        self.log("train_loss", loss, prog_bar=True, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         loss = self.common_step(batch, batch_idx)
-        self.log("val_loss", loss, prog_bar=True)
+        self.log("val_loss", loss, prog_bar=True, on_epoch=True)
         return loss
 
     def configure_optimizers(self):
@@ -134,6 +135,37 @@ class MyLightningCLI(LightningCLI):
         parser.add_argument("--watchmodel", action="store_true")
 
 
+class MetricsCSVCallback(Callback):
+    """Writes epoch-level train/val losses to metrics.csv in the log directory."""
+
+    def __init__(self):
+        super().__init__()
+        self.metrics_path = None
+        self._writer = None
+        self._file = None
+
+    def _init_writer(self, log_dir):
+        self.metrics_path = Path(log_dir) / "metrics.csv"
+        self._file = open(self.metrics_path, "w", newline="")
+        self._writer = csv.writer(self._file)
+        self._writer.writerow(["epoch", "train_loss", "val_loss"])
+
+    def on_fit_start(self, trainer, pl_module):
+        log_dir = trainer.log_dir or trainer.default_root_dir
+        self._init_writer(log_dir)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if not trainer.is_global_zero:
+            return
+        epoch = trainer.current_epoch
+        train_loss = trainer.callback_metrics.get("train_loss")
+        val_loss = trainer.callback_metrics.get("val_loss")
+        train_val = train_loss.item() if train_loss is not None else ""
+        val_val = val_loss.item() if val_loss is not None else ""
+        self._writer.writerow([epoch, train_val, val_val])
+        self._file.flush()
+
+
 def cli_main(default_config_filename="./configs/default.yaml"):
     save_config_fn = default_config_filename.replace(".yaml", "-latest.yaml")
 
@@ -156,15 +188,13 @@ def cli_main(default_config_filename="./configs/default.yaml"):
     ts = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     run_name = f"CLIP_{ts}"
 
-    csv_logger = CSVLogger(cli.trainer.default_root_dir, name=run_name)
+    csv_callback = MetricsCSVCallback()
 
     if cli.trainer.logger is not None:
-        existing_logger = cli.trainer.logger
-        cli.trainer.logger = LoggerCollection([existing_logger, csv_logger])
-        existing_logger.experiment.name = run_name
-        existing_logger.log_hyperparams(cli.datamodule.hparams)
-    else:
-        cli.trainer.logger = csv_logger
+        cli.trainer.logger.experiment.name = run_name
+        cli.trainer.logger.log_hyperparams(cli.datamodule.hparams)
+
+    cli.trainer.callbacks.append(csv_callback)
 
     dirname_cfg = Path(default_config_filename).parent
     dir_log_cfg = Path(cli.trainer.log_dir) / dirname_cfg
