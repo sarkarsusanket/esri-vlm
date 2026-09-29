@@ -1,3 +1,6 @@
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = "2,3"
+
 from collections import OrderedDict
 from typing import Tuple, Union, Optional
 

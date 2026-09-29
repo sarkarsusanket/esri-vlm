@@ -1,3 +1,6 @@
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = "2,3"
+
 import io
 from typing import Any, Callable, Dict, List, Optional
 

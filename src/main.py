@@ -1,3 +1,6 @@
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = "2,3"
+
 import csv
 from datetime import datetime
 from pathlib import Path
@@ -207,7 +210,7 @@ def cli_main(default_config_filename="./configs/default.yaml"):
 
 
 if __name__ == "__main__":
-    config_fn = rf"D:\Code\esri-vlm\src\config.yaml"
+    config_fn = rf"/home/susanket/esri-vlm/src/config.yaml"
 
     if torch.cuda.is_available() and torch.cuda.get_device_name(device=0) == "NVIDIA A100 80GB PCIe":
         torch.set_float32_matmul_precision("highest")

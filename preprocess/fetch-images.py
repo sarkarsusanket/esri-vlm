@@ -1,6 +1,6 @@
 """
 Fetch ArcGIS Wayback imagery tiles for N spatial targets sampled inside a GeoJSON polygon,
-balanced evenly across grid cells from an input Grid Shapefile.
+filtered by cloud cover percentage and Shannon entropy.
 
 Data Preprocessing Ratios:
 - 60% Single Images: Fixed zoom 18, year 2026 (release 26334)
@@ -12,32 +12,35 @@ Data Preprocessing Ratios:
         - 45134 (2022)
         - 26334 (2026)
 
-Usage:
-    python fetch_wayback_tiles.py \
-        --geojson world_poly.geojson \
-        --grid-shp world_grid.shp \
-        --num-points 10000 \
-        --out tiles_dataset.parquet \
-        --mapping-out centroid_tile_map.parquet \
-        --concurrency 150 \
-        --batch-size 50000
+Filtering Rules:
+1. Cloud Cover: Discard images with > 5% cloud cover.
+2. Entropy Survival:
+   - Entropy < 4.0: Discard (0% survival)
+   - 4.0 <= Entropy <= 6.0: 25% survival chance
+   - Entropy > 6.0: Always keep (100% survival)
+
+Output:
+Saves saved image records into chunked parquet files (e.g. image-00.parquet, image-01.parquet).
 """
 
 import argparse
 import asyncio
+import io
 import math
 import os
+import random
 import time
 import uuid
 from dataclasses import dataclass
 
-os.environ['SHAPE_RESTORE_SHX']="YES"
+os.environ['SHAPE_RESTORE_SHX'] = "YES"
 
 import aiohttp
 import geopandas as gpd
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+from PIL import Image
 from shapely.geometry import Point
 
 # Release ID to Year Mapping
@@ -56,13 +59,74 @@ TILE_URL_TMPL = (
 
 
 # --------------------------------------------------------------------------
+# Image Analysis Functions
+# --------------------------------------------------------------------------
+def compute_image_entropy(img: Image.Image) -> float:
+    """Calculates Shannon entropy for a PIL Image (0 to 8 bits)."""
+    try:
+        gray_img = img.convert("L")
+        histogram = gray_img.histogram()
+        total_pixels = sum(histogram)
+
+        entropy = 0.0
+        for count in histogram:
+            if count > 0:
+                p = count / total_pixels
+                entropy -= p * math.log2(p)
+        return entropy
+    except Exception:
+        return 0.0
+
+
+def compute_cloud_cover(img: Image.Image, brightness_thresh=200, sat_thresh=35) -> float:
+    """Calculates Cloud Percentage (%) based on RGB brightness and saturation."""
+    try:
+        rgb_img = img.convert("RGB")
+        img_np = np.array(rgb_img, dtype=np.float32)
+
+        R, G, B = img_np[:, :, 0], img_np[:, :, 1], img_np[:, :, 2]
+        luminance = (R + G + B) / 3.0
+
+        max_c = np.maximum(R, np.maximum(G, B))
+        min_c = np.minimum(R, np.minimum(G, B))
+        saturation = np.where(max_c == 0, 0, (max_c - min_c) / max_c) * 255.0
+
+        cloud_mask = (luminance >= brightness_thresh) & (saturation <= sat_thresh)
+        cloud_pct = float((np.sum(cloud_mask) / cloud_mask.size) * 100.0)
+        return cloud_pct
+    except Exception:
+        return 100.0  # Treat corrupt/unreadable images as full cloud to drop them
+
+
+def evaluate_image_survival(image_bytes: bytes) -> tuple[bool, float, float]:
+    """Applies Cloud and Entropy filters to determine if an image should survive."""
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+
+        # 1. Cloud Cover Check (> 5% discarded)
+        cloud_pct = compute_cloud_cover(img)
+        if cloud_pct > 5.0:
+            return False, cloud_pct, 0.0
+
+        # 2. Shannon Entropy Check
+        entropy = compute_image_entropy(img)
+
+        if entropy < 4.0:
+            return False, cloud_pct, entropy  # 0% survival
+        elif 4.0 <= entropy <= 6.0:
+            survives = random.random() < 0.25  # 25% survival chance
+            return survives, cloud_pct, entropy
+        else:
+            return True, cloud_pct, entropy  # > 6.0 always survives
+
+    except Exception:
+        return False, 100.0, 0.0
+
+
+# --------------------------------------------------------------------------
 # Sampling Points Uniformly per Grid Cell
 # --------------------------------------------------------------------------
 def sample_points_in_geojson_grid(geojson_path: str, grid_path: str, total_n_points: int) -> np.ndarray:
-    """
-    Reads a GeoJSON file and a Grid Shapefile. Intersects the target region with the grid cells,
-    and uniformly samples roughly equal numbers of random (lon, lat) points from each grid cell.
-    """
     print(f"Loading GeoJSON boundary from {geojson_path}...")
     poly_gdf = gpd.read_file(geojson_path)
     if poly_gdf.crs is not None and poly_gdf.crs.to_epsg() != 4326:
@@ -74,7 +138,6 @@ def sample_points_in_geojson_grid(geojson_path: str, grid_path: str, total_n_poi
     if grid_gdf.crs is not None and grid_gdf.crs.to_epsg() != 4326:
         grid_gdf = grid_gdf.to_crs(epsg=4326)
 
-    # Find grid cells that actually intersect with our target region polygon
     print("Computing grid cell intersections...")
     valid_cells = grid_gdf[grid_gdf.geometry.intersects(region_poly)].copy()
     num_cells = len(valid_cells)
@@ -82,7 +145,6 @@ def sample_points_in_geojson_grid(geojson_path: str, grid_path: str, total_n_poi
     if num_cells == 0:
         raise ValueError("No grid cells from the shapefile intersect with the provided GeoJSON polygon!")
 
-    # Calculate target samples per grid cell
     pts_per_cell = math.ceil(total_n_points / num_cells)
     print(f"Intersecting grid cells: {num_cells:,}")
     print(f"Targeting ~{pts_per_cell:,} samples per grid cell to reach ~{total_n_points:,} total points...")
@@ -90,7 +152,6 @@ def sample_points_in_geojson_grid(geojson_path: str, grid_path: str, total_n_poi
     all_sampled_coords = []
 
     for idx, cell in enumerate(valid_cells.geometry):
-        # The region inside this specific cell
         intersection = cell.intersection(region_poly)
         if intersection.is_empty:
             continue
@@ -99,7 +160,6 @@ def sample_points_in_geojson_grid(geojson_path: str, grid_path: str, total_n_poi
         cell_coords = []
         batch_size = max(pts_per_cell * 3, 1000)
 
-        # Rejection sampling inside the cell's bounding box
         while len(cell_coords) < pts_per_cell:
             rand_lons = np.random.uniform(min_x, max_x, size=batch_size)
             rand_lats = np.random.uniform(min_y, max_y, size=batch_size)
@@ -113,8 +173,7 @@ def sample_points_in_geojson_grid(geojson_path: str, grid_path: str, total_n_poi
                     break
 
         all_sampled_coords.extend(cell_coords)
-        
-        # Trim if we exceed total_n_points
+
         if len(all_sampled_coords) >= total_n_points:
             all_sampled_coords = all_sampled_coords[:total_n_points]
             break
@@ -128,7 +187,6 @@ def sample_points_in_geojson_grid(geojson_path: str, grid_path: str, total_n_poi
 
 
 def sample_points_in_geojson_simple(geojson_path: str, n_points: int) -> np.ndarray:
-    """Fallback uniform sampling without a grid shapefile."""
     print(f"Loading GeoJSON from {geojson_path}...")
     gdf = gpd.read_file(geojson_path)
 
@@ -161,9 +219,6 @@ def sample_points_in_geojson_simple(geojson_path: str, n_points: int) -> np.ndar
 # Preprocessing Dataset Pipeline
 # --------------------------------------------------------------------------
 def generate_tile_fetch_requests(coords: np.ndarray):
-    """
-    Splits input coordinates into 60% single and 40% multi-scale/multi-temporal requests.
-    """
     n_total = len(coords)
     n_multi = int(n_total * 0.40)
     n_single = n_total - n_multi
@@ -310,14 +365,14 @@ def load_checkpoint(ckpt_path):
     return set()
 
 
-def _merge_parquet(main_path, part_path):
-    main_table = pq.read_table(main_path)
-    part_table = pq.read_table(part_path)
-    combined = pa.concat_tables([main_table, part_table])
-    tmp_out = main_path + ".merged"
-    pq.write_table(combined, tmp_out)
-    os.replace(tmp_out, main_path)
-    os.remove(part_path)
+def get_chunk_filename(base_path: str, chunk_idx: int) -> str:
+    """Formats file path to 'image-00.parquet', 'image-01.parquet', etc.
+
+    using the directory of the base_path argument.
+    """
+    dirname = os.path.dirname(base_path)
+    filename = f"image-{chunk_idx:02d}.parquet"
+    return os.path.join(dirname, filename) if dirname else filename
 
 
 # --------------------------------------------------------------------------
@@ -375,21 +430,34 @@ async def run(args):
         ("tile_lon", pa.float64()),
         ("file_name", pa.string()),
         ("image_bytes", pa.binary()),
+        ("cloud_pct", pa.float32()),
+        ("entropy", pa.float32()),
     ])
 
-    write_mode_new = not os.path.exists(args.out)
-    writer = pq.ParquetWriter(args.out, schema) if write_mode_new else None
-    if writer is None:
-        part_path = args.out + ".resume_part"
-        writer = pq.ParquetWriter(part_path, schema)
-    else:
-        part_path = None
+    # Dynamic Parquet Chunking Setup
+    chunk_idx = 0
+    records_in_current_chunk = 0
+    current_chunk_path = get_chunk_filename(args.out, chunk_idx)
+    
+    # Handle resuming into current chunk or rolling over
+    while os.path.exists(current_chunk_path):
+        meta = pq.read_metadata(current_chunk_path)
+        if meta.num_rows < args.chunk_size:
+            records_in_current_chunk = meta.num_rows
+            break
+        chunk_idx += 1
+        current_chunk_path = get_chunk_filename(args.out, chunk_idx)
+
+    writer = pq.ParquetWriter(current_chunk_path, schema)
+    print(f"Writing dataset chunks to: {current_chunk_path} (Starting at {records_in_current_chunk:,} records)")
 
     # 5. Async Fetch Loop
     connector = aiohttp.TCPConnector(limit=args.concurrency, ttl_dns_cache=300)
     sem = asyncio.Semaphore(args.concurrency)
 
     n_fetched = 0
+    n_saved = 0
+    n_discarded = 0
     n_missing = 0
     t0 = time.time()
 
@@ -402,6 +470,7 @@ async def run(args):
 
             group_id_col, multi_col, zoom_col, rel_col, year_col = [], [], [], [], []
             lat_col, lon_col, name_col, bytes_col = [], [], [], []
+            cloud_col, entropy_col = [], []
 
             with open(ckpt_path, "a") as ckpt_f:
                 for req in batch:
@@ -410,6 +479,16 @@ async def run(args):
 
                     if res is None or res.content is None:
                         n_missing += 1
+                        ckpt_f.write(key + "\n")
+                        continue
+
+                    n_fetched += 1
+
+                    # Apply Cloud and Entropy Filtering
+                    survives, cloud_pct, entropy = evaluate_image_survival(res.content)
+
+                    if not survives:
+                        n_discarded += 1
                         ckpt_f.write(key + "\n")
                         continue
 
@@ -424,10 +503,45 @@ async def run(args):
                     lon_col.append(lon)
                     name_col.append(req["file_name"])
                     bytes_col.append(res.content)
+                    cloud_col.append(cloud_pct)
+                    entropy_col.append(entropy)
 
                     ckpt_f.write(key + "\n")
-                    n_fetched += 1
+                    n_saved += 1
+                    records_in_current_chunk += 1
 
+                    # Check chunk size limit (1 Million items)
+                    if records_in_current_chunk >= args.chunk_size:
+                        # Write current accumulator batch before switching files
+                        if name_col:
+                            batch_table = pa.table({
+                                "group_id": group_id_col,
+                                "is_multi_group": multi_col,
+                                "zoom": zoom_col,
+                                "release_id": rel_col,
+                                "year": year_col,
+                                "tile_lat": lat_col,
+                                "tile_lon": lon_col,
+                                "file_name": name_col,
+                                "image_bytes": bytes_col,
+                                "cloud_pct": cloud_col,
+                                "entropy": entropy_col,
+                            }, schema=schema)
+                            writer.write_table(batch_table)
+                            # Reset column lists
+                            group_id_col, multi_col, zoom_col, rel_col, year_col = [], [], [], [], []
+                            lat_col, lon_col, name_col, bytes_col = [], [], [], []
+                            cloud_col, entropy_col = [], []
+
+                        # Close current parquet chunk and open next
+                        writer.close()
+                        chunk_idx += 1
+                        current_chunk_path = get_chunk_filename(args.out, chunk_idx)
+                        writer = pq.ParquetWriter(current_chunk_path, schema)
+                        records_in_current_chunk = 0
+                        print(f"\n[Chunk Limit Reached] Rolled over to: {current_chunk_path}")
+
+            # Write remaining buffered batch to current chunk
             if name_col:
                 batch_table = pa.table({
                     "group_id": group_id_col,
@@ -439,21 +553,22 @@ async def run(args):
                     "tile_lon": lon_col,
                     "file_name": name_col,
                     "image_bytes": bytes_col,
+                    "cloud_pct": cloud_col,
+                    "entropy": entropy_col,
                 }, schema=schema)
                 writer.write_table(batch_table)
 
             elapsed = time.time() - t0
             rate = n_fetched / elapsed if elapsed > 0 else 0
             print(f"  [{i + len(batch):,}/{len(todo):,}] fetched={n_fetched:,} "
-                  f"missing={n_missing:,} rate={rate:.1f} tiles/s", end="\r")
+                  f"saved={n_saved:,} discarded={n_discarded:,} missing={n_missing:,} "
+                  f"rate={rate:.1f} tiles/s", end="\r")
 
     writer.close()
     print()
 
-    if part_path is not None:
-        _merge_parquet(args.out, part_path)
-
-    print(f"Done. {n_fetched:,} tiles saved, {n_missing:,} missing/404 -> {args.out}")
+    print(f"Done. {n_saved:,} total tiles saved across {chunk_idx + 1} chunk file(s), "
+          f"{n_discarded:,} discarded by filters, {n_missing:,} missing/404.")
 
 
 def parse_args():
@@ -461,8 +576,9 @@ def parse_args():
     p.add_argument("--geojson", required=True, help="Path to input GeoJSON polygon file")
     p.add_argument("--grid-shp", help="Path to shapefile containing global grid polygons")
     p.add_argument("--num-points", "-n", type=int, default=10000, help="Number of points to sample across the region")
-    p.add_argument("--out", required=True, help="Output parquet path for tile images")
+    p.add_argument("--out", required=True, help="Base path for tile images (e.g., ./data/tiles.parquet)")
     p.add_argument("--mapping-out", required=True, help="Output parquet mapping every centroid request to its file_name")
+    p.add_argument("--chunk-size", type=int, default=1000000, help="Maximum number of saved images per Parquet chunk file")
     p.add_argument("--concurrency", type=int, default=150)
     p.add_argument("--batch-size", type=int, default=50000)
     return p.parse_args()

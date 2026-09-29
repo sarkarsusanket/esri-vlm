@@ -15,12 +15,12 @@ model:
   tokenizer_name: "openai/clip-vit-base-patch32"
 
 data:
-  parquet_path: "E:/Data/query-earth/git-10mil/git_10m_1000000_random.parquet"
-  batch_size: 64
-  num_workers: 4
+  parquet_path: "/data/susanket/vlm/tbd.parquet"
+  batch_size: 128
+  num_workers: 8
   image_resolution: 224
   val_fraction: 0.1
 
 trainer:
-  max_epochs: 32
+  max_epochs: 100
   accumulate_grad_batches: 16
