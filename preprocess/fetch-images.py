@@ -2,6 +2,8 @@
 Fetch ArcGIS Wayback imagery tiles for N spatial targets sampled inside a GeoJSON polygon,
 filtered by cloud cover percentage and Shannon entropy.
 
+python /home/susanket/esri-vlm/preprocess/fetch-images.py --geojson /data/susanket/data/global/world.geojson --grid-shp /data/susanket/data/global/demo-sampling/grids.shp -n 1000000 --out /data/susanket/vlm/images/image-06.parquet --mapping-out /data/susanket/vlm/map.parquet
+
 Data Preprocessing Ratios:
 - 60% Single Images: Fixed zoom 18, year 2026 (release 26334)
 - 40% Multi-Group (Multi-Scale & Multi-Temporal):
@@ -220,7 +222,7 @@ def sample_points_in_geojson_simple(geojson_path: str, n_points: int) -> np.ndar
 # --------------------------------------------------------------------------
 def generate_tile_fetch_requests(coords: np.ndarray):
     n_total = len(coords)
-    n_multi = int(n_total * 0.40)
+    n_multi = int(n_total * 0.60)   # 60% of the total imagery is mutli-resolution
     n_single = n_total - n_multi
 
     print(f"Dataset Preprocessing Plan:\n"
@@ -232,8 +234,8 @@ def generate_tile_fetch_requests(coords: np.ndarray):
     single_indices = indices[:n_single]
     multi_indices = indices[n_single:]
 
-    zoom_levels = [14, 15, 16, 17, 18]
-    zoom_probs = [0.10, 0.20, 0.25, 0.20, 0.25]
+    zoom_levels = [17, 18, 19, 20]#[14, 15, 16, 17, 18]
+    zoom_probs = [0.1, 0.4, 0.4, 0.1]#[0.10, 0.20, 0.25, 0.20, 0.25]
 
     requests = []
 
@@ -241,9 +243,9 @@ def generate_tile_fetch_requests(coords: np.ndarray):
     for idx in single_indices:
         lon, lat = coords[idx]
         gid = str(uuid.uuid4())
-        z = 18
-        rel_id = 26334  # 2026 release
-        year = WAYBACK_RELEASES[rel_id]
+        z = 19
+        rel_id = random.choice([26334, 22252, 13192, 51127, 58924])  # 2026/2025 release
+        year = 2025 # WAYBACK_RELEASES[rel_id]
 
         x, y = latlon_to_tile(lat, lon, z)
         requests.append({

@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = "2,3"
+os.environ['CUDA_VISIBLE_DEVICES'] = "1,2"
 
 import io
 from typing import Any, Callable, Dict, List, Optional
@@ -21,11 +21,15 @@ class ParquetCLIPDataset(Dataset):
     def __init__(
         self,
         parquet_path: str,
+        image_col: str,
+        caption_col: str,
         image_transform: Optional[Callable] = None,
     ):
         self.df = pd.read_parquet(parquet_path)
-        assert "image_bytes" in self.df.columns, "parquet must have 'image_bytes' column"
-        assert "caption" in self.df.columns, "parquet must have 'caption' column"
+        self.image_col = image_col
+        self.caption_col = caption_col
+        assert image_col in self.df.columns, "parquet must have 'image_bytes' column"
+        assert caption_col in self.df.columns, "parquet must have 'caption' column"
         self.image_transform = image_transform
 
     def __len__(self) -> int:
@@ -34,13 +38,13 @@ class ParquetCLIPDataset(Dataset):
     def __getitem__(self, index: int) -> Dict[str, Any]:
         row = self.df.iloc[index]
 
-        image_bytes = row["image_bytes"]
+        image_bytes = row[self.image_col]
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
         if self.image_transform is not None:
             image = self.image_transform(image)
 
-        caption = str(row["caption"])
+        caption = str(row[self.caption_col])
 
         return {"image": image, "caption": caption}
 
@@ -72,6 +76,8 @@ class CLIPDataModule(pl.LightningDataModule):
     def __init__(
         self,
         parquet_path: str,
+        image_col: str = "image_bytes",
+        caption_col: str = "caption",
         batch_size: int = 64,
         num_workers: int = 4,
         image_resolution: int = 224,
@@ -79,6 +85,8 @@ class CLIPDataModule(pl.LightningDataModule):
     ):
         super().__init__()
         self.parquet_path = parquet_path
+        self.image_col = image_col
+        self.caption_col = caption_col
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.image_resolution = image_resolution
@@ -88,6 +96,8 @@ class CLIPDataModule(pl.LightningDataModule):
     def setup(self, stage: str = "fit"):
         full_dataset = ParquetCLIPDataset(
             self.parquet_path,
+            self.image_col,
+            self.caption_col,
             image_transform=get_clip_image_transform(self.image_resolution, is_train=True),
         )
 
@@ -99,6 +109,8 @@ class CLIPDataModule(pl.LightningDataModule):
 
         self.val_dataset.dataset = ParquetCLIPDataset(
             self.parquet_path,
+            self.image_col,
+            self.caption_col,
             image_transform=get_clip_image_transform(self.image_resolution, is_train=False),
         )
 

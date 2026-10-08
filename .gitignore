@@ -1,6 +1,6 @@
 /data
 *.parquet
-*/__pycache__
+*__pycache__/
 */lightning_logs
 .yolo*
 *.pt

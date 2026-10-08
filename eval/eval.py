@@ -1,27 +1,13 @@
 """
-Image retrieval evaluation script.
+Image-Text cross-modal retrieval evaluation script.
 
 Usage:
-    python eval.py --ckpt_path path/to/checkpoint.ckpt --benchmark_root path/to/benchmark
-
-Benchmark structure:
-    benchmark_root/
-        dataset_1/
-            class_a/
-                img1.jpg
-                img2.jpg
-            class_b/
-                img1.jpg
-                ...
-        dataset_2/
-            ...
+    python eval.py --ckpt_path path/to/checkpoint.ckpt
 """
 
 import argparse
-import base64
-import io
-import math
 import os
+import sys
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -33,9 +19,9 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+from transformers import CLIPTokenizer
 
-import sys
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.append(rf"/home/susanket/esri-vlm/src")
 from model import CLIP, build_model
 from main import CLIPLightningModule
 
@@ -43,7 +29,7 @@ from main import CLIPLightningModule
 IMAGENET_MEAN = [0.48145466, 0.4578275, 0.40821073]
 IMAGENET_STD = [0.26862954, 0.26130258, 0.27577711]
 
-BENCHMARK_ROOT = rf""
+BENCHMARK_ROOT = rf"/data/susanket/vlm/eval"
 
 
 class ImageFolderFlat(Dataset):
@@ -69,7 +55,7 @@ class ImageFolderFlat(Dataset):
         for cls_name in self.class_names:
             cls_dir = self.root / cls_name
             for img_path in sorted(cls_dir.iterdir()):
-                if img_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}:
+                if img_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}:
                     self.samples.append((img_path, cls_name))
 
     def __len__(self):
@@ -85,7 +71,7 @@ class ImageFolderFlat(Dataset):
         return image, self.class_to_idx[cls_name], str(path)
 
 
-def compute_embeddings(model: CLIP, dataloader: DataLoader, device: torch.device) -> Tuple[np.ndarray, np.ndarray]:
+def compute_image_embeddings(model: CLIP, dataloader: DataLoader, device: torch.device) -> Tuple[np.ndarray, np.ndarray]:
     """Compute normalized image embeddings for all samples."""
     model.eval()
     all_embeddings = []
@@ -102,66 +88,113 @@ def compute_embeddings(model: CLIP, dataloader: DataLoader, device: torch.device
     return np.concatenate(all_embeddings, axis=0), np.concatenate(all_labels, axis=0)
 
 
-def recall_at_k(sim_matrix: np.ndarray, labels: np.ndarray, k: int) -> float:
-    """Compute Recall@K: fraction of queries where correct class is in top-k."""
+def compute_text_embeddings(model: CLIP, class_names: List[str], device: torch.device) -> np.ndarray:
+    """Compute normalized text embeddings for class prompt strings."""
+    model.eval()
+    # Standard prompt template for satellite/remote sensing imagery classification
+    prompts = [f"a satellite photo of {cls.replace('_', ' ')}" for cls in class_names]
+
+    with torch.no_grad():
+        # Tokenize text prompts
+        tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+        text_tokens = tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            max_length=model.transformer.context_length,
+            return_tensors="pt",
+        ).input_ids.to(device)
+
+        # Adjust tokenize according to your model implementation
+        text_embeddings = model.encode_text(text_tokens)
+        text_embeddings = F.normalize(text_embeddings, dim=-1)
+
+    return text_embeddings.cpu().numpy()
+
+
+def recall_at_k(sim_matrix: np.ndarray, targets: np.ndarray, k: int) -> float:
+    """
+    Compute Recall@K for retrieval.
+    sim_matrix shape: (num_queries, num_candidates)
+    targets: ground truth class index for each candidate (or query depending on mode)
+    """
     correct = 0
-    n = len(labels)
-    for i in range(n):
+    num_queries = sim_matrix.shape[0]
+
+    for i in range(num_queries):
         ranking = np.argsort(-sim_matrix[i])
-        top_k_classes = labels[ranking[:k]]
-        if labels[i] in top_k_classes:
+        top_k_indices = ranking[:k]
+
+        # Query class is i if query is text prompt, or query class is targets[i]
+        query_target = i if len(targets) != num_queries else targets[i]
+        candidate_classes = targets[top_k_indices] if len(targets) == sim_matrix.shape[1] else top_k_indices
+
+        if query_target in candidate_classes:
             correct += 1
-    return correct / n
+
+    return correct / num_queries
 
 
-def mean_reciprocal_rank(sim_matrix: np.ndarray, labels: np.ndarray) -> float:
-    """Compute MRR: mean of 1/rank of first correct result."""
+def mean_reciprocal_rank(sim_matrix: np.ndarray, targets: np.ndarray) -> float:
+    """Compute MRR: mean of 1/rank of first correct match."""
     rr_sum = 0.0
-    n = len(labels)
-    for i in range(n):
+    num_queries = sim_matrix.shape[0]
+
+    for i in range(num_queries):
         ranking = np.argsort(-sim_matrix[i])
-        ranked_labels = labels[ranking]
-        matches = np.where(ranked_labels == labels[i])[0]
+
+        query_target = i if len(targets) != num_queries else targets[i]
+        candidate_classes = targets[ranking] if len(targets) == sim_matrix.shape[1] else ranking
+
+        matches = np.where(candidate_classes == query_target)[0]
         if len(matches) > 0:
             rr_sum += 1.0 / (matches[0] + 1)
-    return rr_sum / n
+
+    return rr_sum / num_queries
 
 
-def mean_average_precision(sim_matrix: np.ndarray, labels: np.ndarray) -> float:
-    """Compute MAP: mean of average precision across all queries."""
+def mean_average_precision(sim_matrix: np.ndarray, targets: np.ndarray) -> float:
+    """Compute MAP across cross-modal queries."""
     ap_sum = 0.0
-    n = len(labels)
-    for i in range(n):
+    num_queries = sim_matrix.shape[0]
+
+    for i in range(num_queries):
         ranking = np.argsort(-sim_matrix[i])
-        ranked_labels = labels[ranking]
-        relevant = (ranked_labels == labels[i]).astype(float)
+
+        query_target = i if len(targets) != num_queries else targets[i]
+        candidate_classes = targets[ranking] if len(targets) == sim_matrix.shape[1] else ranking
+
+        relevant = (candidate_classes == query_target).astype(float)
         num_relevant = relevant.sum()
+
         if num_relevant == 0:
             continue
+
         precision_at_k = np.cumsum(relevant) / (np.arange(len(relevant)) + 1)
         ap = (precision_at_k * relevant).sum() / num_relevant
         ap_sum += ap
-    return ap_sum / n
+
+    return ap_sum / num_queries
 
 
 def evaluate_dataset(model: CLIP, dataset: ImageFolderFlat, device: torch.device, batch_size: int = 64) -> Dict:
-    """Evaluate retrieval on a single dataset."""
+    """Evaluate Text-to-Image (T2I) retrieval performance."""
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    emb, labels = compute_embeddings(model, loader, device)
+    img_emb, img_labels = compute_image_embeddings(model, loader, device)
+    txt_emb = compute_text_embeddings(model, dataset.class_names, device)
 
-    sim_matrix = emb @ emb.T
-
-    n_classes = len(dataset.class_names)
+    # Text-to-Image similarity matrix (num_classes, num_images)
+    t2i_sim_matrix = txt_emb @ img_emb.T
 
     results = {
         "num_images": len(dataset),
-        "num_classes": n_classes,
-        "R@1": recall_at_k(sim_matrix, labels, 1),
-        "R@5": recall_at_k(sim_matrix, labels, 5),
-        "R@10": recall_at_k(sim_matrix, labels, 10),
-        "MRR": mean_reciprocal_rank(sim_matrix, labels),
-        "MAP": mean_average_precision(sim_matrix, labels),
+        "num_classes": len(dataset.class_names),
+        "R@1": recall_at_k(t2i_sim_matrix, img_labels, 1),
+        "R@5": recall_at_k(t2i_sim_matrix, img_labels, 5),
+        "R@10": recall_at_k(t2i_sim_matrix, img_labels, 10),
+        "MRR": mean_reciprocal_rank(t2i_sim_matrix, img_labels),
+        "MAP": mean_average_precision(t2i_sim_matrix, img_labels),
     }
     return results
 
@@ -203,7 +236,7 @@ def generate_html_report(
 <html>
 <head>
 <meta charset="utf-8">
-<title>Evaluation Report - {ckpt_name}</title>
+<title>T2I Retrieval Report - {ckpt_name}</title>
 <style>
     body {{
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -225,7 +258,6 @@ def generate_html_report(
         margin-bottom: 30px;
         font-size: 14px;
     }}
-    .meta strong {{ color: #333; }}
     table {{
         width: 100%;
         border-collapse: collapse;
@@ -246,21 +278,17 @@ def generate_html_report(
         padding: 10px 16px;
         border-bottom: 1px solid #eee;
     }}
-    tr:hover td {{
-        background: #f0f7ff;
-    }}
+    tr:hover td {{ background: #f0f7ff; }}
     tr.avg-row td {{
         font-weight: 700;
         background: #e8f4fd;
         border-top: 2px solid #0066cc;
     }}
-    .metric-val {{
-        font-variant-numeric: tabular-nums;
-    }}
+    .metric-val {{ font-variant-numeric: tabular-nums; }}
 </style>
 </head>
 <body>
-    <h1>Image Retrieval Evaluation Report</h1>
+    <h1>Text-to-Image Retrieval Evaluation Report</h1>
     <div class="meta">
         <strong>Checkpoint:</strong> {Path(checkpoint_path).name}<br>
         <strong>Benchmark:</strong> {bench_name} ({n_datasets} datasets)<br>
@@ -303,9 +331,9 @@ def generate_html_report(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate CLIP checkpoint on image retrieval benchmark")
+    parser = argparse.ArgumentParser(description="Evaluate CLIP checkpoint on cross-modal retrieval benchmark")
     parser.add_argument("--ckpt_path", type=str, required=True, help="Path to .ckpt checkpoint file")
-    parser.add_argument("--output", type=str, default=None, help="Output HTML path (default: eval_report_<ckpt_name>.html)")
+    parser.add_argument("--output", type=str, default=None, help="Output HTML path")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--device", type=str, default=None)
@@ -322,6 +350,9 @@ def main():
     ckpt = torch.load(args.ckpt_path, map_location=device, weights_only=False)
 
     if "hyper_parameters" in ckpt:
+        for hp_key in ["eval_downstream", "air_temp_data_path", "election_data_path", "_instantiator"]:
+            ckpt['hyper_parameters'].pop(hp_key, None)
+
         lightning_model = CLIPLightningModule(**ckpt["hyper_parameters"]).to(device)
         lightning_model.load_state_dict(ckpt["state_dict"])
         lightning_model.eval()
@@ -333,7 +364,7 @@ def main():
     model.eval()
     print(f"Model loaded on {device}")
 
-    benchmark_root = Path(args.benchmark_root)
+    benchmark_root = Path(BENCHMARK_ROOT)
     dataset_dirs = sorted([d for d in benchmark_root.iterdir() if d.is_dir()])
 
     if not dataset_dirs:
@@ -364,7 +395,7 @@ def main():
         return
 
     output_path = args.output or f"eval_report_{Path(args.ckpt_path).stem}.html"
-    generate_html_report(args.ckpt_path, args.benchmark_root, dataset_results, output_path)
+    generate_html_report(args.ckpt_path, BENCHMARK_ROOT, dataset_results, output_path)
 
     print("\n===== Summary =====")
     avg = defaultdict(float)

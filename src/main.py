@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = "2,3"
+os.environ['CUDA_VISIBLE_DEVICES'] = "1,2"
 
 import csv
 from datetime import datetime
@@ -25,7 +25,7 @@ class CLIPLightningModule(pl.LightningModule):
         # model architecture
         embed_dim: int = 512,
         image_resolution: int = 224,
-        vision_layers: List[int] = [3, 4, 6, 3],
+        vision_layers: int = 12,
         vision_width: int = 64,
         vision_patch_size: int = 32,
         in_channels: int = 3,
@@ -50,7 +50,7 @@ class CLIPLightningModule(pl.LightningModule):
         self.model = CLIP(
             embed_dim=embed_dim,
             image_resolution=image_resolution,
-            vision_layers=tuple(vision_layers),
+            vision_layers=vision_layers,
             vision_width=vision_width,
             vision_patch_size=vision_patch_size,
             in_channels=in_channels,
@@ -60,6 +60,7 @@ class CLIPLightningModule(pl.LightningModule):
             transformer_heads=transformer_heads,
             transformer_layers=transformer_layers,
         )
+        print(self.model)
 
         self.loss_fun = CLIPContrastiveLoss()
         self.learning_rate = learning_rate

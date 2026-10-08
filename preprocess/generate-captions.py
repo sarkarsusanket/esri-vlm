@@ -17,7 +17,7 @@ OLLAMA_MODEL = "ministral-3:3b"
 # Multi-GPU Endpoints
 OLLAMA_ENDPOINTS = [
     "http://127.0.0.1:11434",
-    # "http://127.0.0.1:11435",
+    "http://127.0.0.1:11435",
     # "http://127.0.0.1:11436",
     # "http://127.0.0.1:11437",
 ]

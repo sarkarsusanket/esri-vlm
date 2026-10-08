@@ -1,7 +1,7 @@
 model:
   embed_dim: 512
   image_resolution: 224
-  vision_layers: [3, 4, 6, 3]
+  vision_layers: 12
   vision_width: 64
   vision_patch_size: 32
   in_channels: 3
@@ -16,6 +16,8 @@ model:
 
 data:
   parquet_path: "/data/susanket/vlm/tbd.parquet"
+  image_col: "image_bytes"
+  caption_col: "scene_caption"
   batch_size: 128
   num_workers: 8
   image_resolution: 224
