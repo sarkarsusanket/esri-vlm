@@ -2,18 +2,20 @@ import os
 os.environ['CUDA_VISIBLE_DEVICES'] = "1,2"
 
 import csv
+import math
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Literal, Optional, Tuple
 
 import lightning.pytorch as pl
 import torch
+import torch.nn.functional as F
 from lightning.pytorch.cli import LightningCLI
 from lightning.pytorch.callbacks import Callback
 from transformers import CLIPTokenizer, CLIPTextModel
 
 from model import CLIP
-from loss import CLIPContrastiveLoss
+from loss import NegatedKeywordLoss, build_pair_loss
 from data import CLIPDataModule
 
 torch.set_float32_matmul_precision("high")
@@ -37,6 +39,16 @@ class CLIPLightningModule(pl.LightningModule):
         learning_rate: float = 5e-4,
         weight_decay: float = 0.1,
         warmup_steps: int = 2000,
+        # losses
+        loss_type: Literal["clip", "siglip"] = "clip",
+        use_masks: bool = False,  # True -> load masks and add the region-level loss
+        use_hard_negatives: bool = True,  # mutated dense sentences as extra negatives (data side)
+        w_global: float = 1.0,
+        w_dense: float = 1.0,
+        w_region: float = 1.0,  # only used when use_masks is True
+        w_keyword: float = 0.1,
+        region_min_coverage: float = 0.1,  # a patch belongs to a region if >= this fraction is masked
+        keyword_margin: Optional[float] = None,  # None: plain mean cosine; else mean(relu(cos - margin))
         # tokenizer
         tokenizer_name: str = "openai/clip-vit-base-patch32",
     ) -> None:
@@ -46,6 +58,11 @@ class CLIPLightningModule(pl.LightningModule):
 
         self.tokenizer = CLIPTokenizer.from_pretrained(tokenizer_name)
         vocab_size = self.tokenizer.vocab_size
+
+        assert not use_masks or isinstance(vision_layers, int), "region loss needs the ViT image encoder"
+        # SigLIP: scale = log(10), learnable bias = -10 (paper init); CLIP: scale = log(1/0.07), no bias
+        logit_kwargs = (dict(logit_scale_init=math.log(10.0), use_logit_bias=True, logit_bias_init=-10.0)
+                        if loss_type == "siglip" else {})
 
         self.model = CLIP(
             embed_dim=embed_dim,
@@ -59,10 +76,12 @@ class CLIPLightningModule(pl.LightningModule):
             transformer_width=transformer_width,
             transformer_heads=transformer_heads,
             transformer_layers=transformer_layers,
+            **logit_kwargs,
         )
         print(self.model)
 
-        self.loss_fun = CLIPContrastiveLoss()
+        self.pair_loss = build_pair_loss(loss_type)
+        self.keyword_loss = NegatedKeywordLoss(margin=keyword_margin)
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.warmup_steps = warmup_steps
@@ -77,24 +96,83 @@ class CLIPLightningModule(pl.LightningModule):
         )
         return tokens.input_ids.to(self.device)
 
-    def common_step(self, batch, batch_idx):
-        images = batch["image"]
-        captions = batch["caption"]
+    def _region_embeddings(self, patches: torch.Tensor, cov: torch.Tensor):
+        """Pool patch tokens inside every mask.
 
-        text_tokens = self.tokenize(captions)
+        patches (B, P, D), cov (B, K, g, g) with P == g*g. Returns L2-normalised region
+        embeddings (B, K, D) and a (B, K) bool telling which regions are still visible in the crop.
+        Weights are the masked fraction of every patch, ignoring patches below
+        `region_min_coverage`; if that leaves nothing (small object) the single most covered patch is used.
+        """
+        c = cov.flatten(2).to(patches.dtype)  # (B, K, P)
+        visible = c.amax(-1) > 0
+        w = c * (c >= self.hparams.region_min_coverage)
+        tiny = visible & (w.sum(-1) == 0)
+        if tiny.any():
+            top = F.one_hot(c.argmax(-1), c.shape[-1]).to(c.dtype)
+            w = torch.where(tiny.unsqueeze(-1), top, w)
+        p = F.normalize(patches, dim=-1)  # unit patches: no single high-norm token can dominate
+        emb = torch.bmm(w, p) / w.sum(-1, keepdim=True).clamp_min(1e-6)
+        return F.normalize(emb, dim=-1), visible
 
-        logits_per_image, logits_per_text = self.model(images, text_tokens)
-        return self.loss_fun(logits_per_image, logits_per_text)
+    def common_step(self, batch, batch_idx) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        h = self.hparams
+        images = batch["images"]
+        B = images.shape[0]
+        use_regions = h.use_masks and h.w_region > 0 and "region_cov" in batch
+
+        if use_regions:
+            cls, patches = self.model.encode_image(images, return_patches=True)
+        else:
+            cls = self.model.encode_image(images)
+        img = F.normalize(cls, dim=-1)
+
+        def enc_text(tokens):
+            return F.normalize(self.model.encode_text(tokens), dim=-1)
+
+        losses: Dict[str, torch.Tensor] = {}
+
+        # 1) global: summary caption <-> image CLS
+        if h.w_global > 0:
+            eye = torch.eye(B, dtype=torch.bool, device=img.device)
+            losses["global"] = self.pair_loss(self.model.logits(img, enc_text(batch["global_tokens"])), eye)
+
+        # 2) dense: every sentence <-> its image (+ mutated sentences as hard negatives)
+        if h.w_dense > 0 and "dense_tokens" in batch:
+            logits = self.model.logits(img, enc_text(batch["dense_tokens"]))
+            losses["dense"] = self.pair_loss(logits, batch["dense_pos"])
+
+        # 3) region: masked patches <-> keyword text (only with masks)
+        if use_regions:
+            r_emb, visible = self._region_embeddings(patches, batch["region_cov"])
+            valid = visible & (batch["region_txt"] >= 0)
+            if valid.any():
+                r_txt = enc_text(batch["region_tokens"])
+                pos = F.one_hot(batch["region_txt"][valid], r_txt.shape[0]).bool()
+                losses["region"] = self.pair_loss(self.model.logits(r_emb[valid], r_txt), pos)
+
+        # 4) keywords: image CLS must NOT match "there is no <keyword that is in the image>"
+        if h.w_keyword > 0 and "kw_tokens" in batch:
+            losses["keyword"] = self.keyword_loss(img, enc_text(batch["kw_tokens"]),
+                                                  batch["kw_img"], batch["kw_txt"])
+
+        weights = {"global": h.w_global, "dense": h.w_dense, "region": h.w_region, "keyword": h.w_keyword}
+        total = sum(weights[k] * v for k, v in losses.items())
+        return total, losses
+
+    def _shared_step(self, batch, batch_idx, stage: str):
+        total, losses = self.common_step(batch, batch_idx)
+        bs = batch["images"].shape[0]
+        self.log(f"{stage}_loss", total, prog_bar=True, on_epoch=True, batch_size=bs)
+        for name, value in losses.items():
+            self.log(f"{stage}_loss_{name}", value.detach(), on_epoch=True, batch_size=bs)
+        return total
 
     def training_step(self, batch, batch_idx):
-        loss = self.common_step(batch, batch_idx)
-        self.log("train_loss", loss, prog_bar=True, on_epoch=True)
-        return loss
+        return self._shared_step(batch, batch_idx, "train")
 
     def validation_step(self, batch, batch_idx):
-        loss = self.common_step(batch, batch_idx)
-        self.log("val_loss", loss, prog_bar=True, on_epoch=True)
-        return loss
+        return self._shared_step(batch, batch_idx, "val")
 
     def configure_optimizers(self):
         exclude = (
@@ -137,6 +215,16 @@ class CLIPLightningModule(pl.LightningModule):
 class MyLightningCLI(LightningCLI):
     def add_arguments_to_parser(self, parser):
         parser.add_argument("--watchmodel", action="store_true")
+        # one source of truth: these are set under `model:` and forwarded to the datamodule
+        parser.link_arguments("model.image_resolution", "data.image_resolution")
+        parser.link_arguments("model.vision_patch_size", "data.patch_size")
+        parser.link_arguments("model.context_length", "data.context_length")
+        parser.link_arguments("model.tokenizer_name", "data.tokenizer_name")
+        parser.link_arguments("model.use_masks", "data.use_masks")
+        parser.link_arguments("model.use_hard_negatives", "data.use_hard_negatives")
+        # a loss with weight 0 is switched off on the data side too (no tokenizing / negatives)
+        parser.link_arguments("model.w_dense", "data.use_dense", compute_fn=lambda w: w > 0)
+        parser.link_arguments("model.w_keyword", "data.use_keywords", compute_fn=lambda w: w > 0)
 
 
 class MetricsCSVCallback(Callback):
@@ -148,25 +236,31 @@ class MetricsCSVCallback(Callback):
         self._writer = None
         self._file = None
 
-    def _init_writer(self, log_dir):
+    def _init_writer(self, log_dir, components):
+        self._components = components
         self.metrics_path = Path(log_dir) / "metrics.csv"
         self._file = open(self.metrics_path, "w", newline="")
         self._writer = csv.writer(self._file)
-        self._writer.writerow(["epoch", "train_loss", "val_loss"])
+        self._keys = ["train_loss", "val_loss"] + [f"{st}_loss_{n}" for n in self._components for st in ("train", "val")]
+        self._writer.writerow(["epoch"] + self._keys)
 
     def on_fit_start(self, trainer, pl_module):
         log_dir = trainer.log_dir or trainer.default_root_dir
-        self._init_writer(log_dir)
+        hp = pl_module.hparams
+        components = [n for n, on in (("global", hp.w_global > 0), ("dense", hp.w_dense > 0),
+                                      ("region", hp.use_masks and hp.w_region > 0),
+                                      ("keyword", hp.w_keyword > 0)) if on]
+        self._init_writer(log_dir, components)
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if not trainer.is_global_zero:
             return
         epoch = trainer.current_epoch
-        train_loss = trainer.callback_metrics.get("train_loss")
-        val_loss = trainer.callback_metrics.get("val_loss")
-        train_val = train_loss.item() if train_loss is not None else ""
-        val_val = val_loss.item() if val_loss is not None else ""
-        self._writer.writerow([epoch, train_val, val_val])
+        row = []
+        for k in self._keys:
+            v = trainer.callback_metrics.get(k)
+            row.append(v.item() if v is not None else "")
+        self._writer.writerow([epoch] + row)
         self._file.flush()
 
 

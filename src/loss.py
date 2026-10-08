@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -105,3 +107,81 @@ class SigLIPLoss(nn.Module):
         loss = -F.logsigmoid(logits_per_image * labels).sum() / num_logits
 
         return {"contrastive_loss": loss} if output_dict else loss
+
+
+# =============================================================================
+# Generalised losses used by the multi-loss training (global / dense / region).
+#
+# Both take `logits` (R, C) and a boolean `pos` (R, C) marking which (row, col) pairs are
+# positives. A row/column may have several positives (a dense caption has 3-6 sentences,
+# the same keyword text is shared by many regions) or none (hard-negative sentences are
+# columns without any positive). With pos = eye(B) they reduce exactly to
+# CLIPContrastiveLoss / SigLIPLoss above.
+# =============================================================================
+
+
+def _mean_over_valid(x: torch.Tensor, valid: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    if valid.any():
+        return x[valid].mean()
+    return ref.sum() * 0.0  # keeps the graph alive for DDP when there is nothing to learn from
+
+
+class MultiPositiveCLIPLoss(nn.Module):
+    """Symmetric softmax contrastive loss with any number of positives per row / column.
+
+    image->text: for every row with >=1 positive, -mean_{p in pos(row)} log softmax_row[p].
+    text->image: same over columns. Rows/columns without a positive are skipped in that
+    direction but still act as negatives in the other one (that is how hard negatives work).
+    """
+
+    def forward(self, logits: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        posf = pos.to(logits.dtype)
+
+        n_row = posf.sum(1)
+        row = -(F.log_softmax(logits, dim=1) * posf).sum(1) / n_row.clamp_min(1.0)
+        n_col = posf.sum(0)
+        col = -(F.log_softmax(logits, dim=0) * posf).sum(0) / n_col.clamp_min(1.0)
+
+        return 0.5 * (_mean_over_valid(row, n_row > 0, logits) + _mean_over_valid(col, n_col > 0, logits))
+
+
+class MultiPositiveSigLIPLoss(nn.Module):
+    """Pairwise sigmoid loss; label +1 for positives, -1 for everything else.
+
+    Normalised by the number of positive pairs (== B for a B x B diagonal, i.e. the
+    original SigLIP normalisation), so losses with many more negatives per positive
+    (dense, region) stay on the same scale as the global loss.
+    """
+
+    def forward(self, logits: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        y = pos.to(logits.dtype) * 2.0 - 1.0
+        return -F.logsigmoid(y * logits).sum() / pos.sum().clamp_min(1)
+
+
+def build_pair_loss(loss_type: str) -> nn.Module:
+    if loss_type == "clip":
+        return MultiPositiveCLIPLoss()
+    if loss_type == "siglip":
+        return MultiPositiveSigLIPLoss()
+    raise ValueError(f"loss_type must be 'clip' or 'siglip', got {loss_type!r}")
+
+
+class NegatedKeywordLoss(nn.Module):
+    """Push images away from false statements such as "there is no solar panel".
+
+    img_emb (B, D) and txt_emb (U, D) are L2-normalised; (kw_img[n], kw_txt[n]) lists the
+    image / negated-sentence pairs. Returns the MEAN cosine similarity over the pairs (the
+    sum divided by the number of pairs, so its scale does not depend on how many keywords
+    were sampled); minimising it lowers the similarity. With `margin` set it becomes
+    mean(relu(cos - margin)), which stops pushing once a pair is already dissimilar enough.
+    """
+
+    def __init__(self, margin: Optional[float] = None):
+        super().__init__()
+        self.margin = margin
+
+    def forward(self, img_emb, txt_emb, kw_img, kw_txt):
+        sims = (img_emb[kw_img] * txt_emb[kw_txt]).sum(-1)
+        if self.margin is not None:
+            sims = F.relu(sims - self.margin)
+        return sims.mean()

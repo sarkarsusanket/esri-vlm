@@ -2,7 +2,9 @@ torch
 lightning
 transformers
 pandas
-torch
+pyarrow
 torchvision
-jsonargparse
+jsonargparse[signatures]
 fastparquet
+pillow
+numpy

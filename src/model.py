@@ -205,7 +205,7 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, return_patches: bool = False):
         x = self.conv1(x)
         x = x.reshape(x.shape[0], x.shape[1], -1)
         x = x.permute(0, 2, 1)
@@ -216,6 +216,13 @@ class VisionTransformer(nn.Module):
         x = x.permute(1, 0, 2)
         x = self.transformer(x)
         x = x.permute(1, 0, 2)
+
+        if return_patches:
+            # LayerNorm is per token, so ln_post(x)[:, 0] == ln_post(x[:, 0]): the CLS output is unchanged.
+            x = self.ln_post(x)
+            if self.proj is not None:
+                x = x @ self.proj
+            return x[:, 0], x[:, 1:]  # (B, D) CLS, (B, num_patches, D) patch tokens in the joint space
 
         x = self.ln_post(x[:, 0, :])
 
@@ -283,6 +290,10 @@ class CLIP(nn.Module):
         transformer_width: int = 512,
         transformer_heads: int = 8,
         transformer_layers: int = 12,
+        # logit scale / bias (SigLIP uses scale=log(10) and a learnable bias=-10)
+        logit_scale_init: float = float(np.log(1 / 0.07)),
+        use_logit_bias: bool = False,
+        logit_bias_init: float = -10.0,
     ):
         super().__init__()
 
@@ -317,7 +328,11 @@ class CLIP(nn.Module):
             transformer_layers=transformer_layers,
         )
 
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        self.logit_scale = nn.Parameter(torch.ones([]) * logit_scale_init)
+        if use_logit_bias:
+            self.logit_bias = nn.Parameter(torch.ones([]) * logit_bias_init)
+        else:
+            self.register_parameter("logit_bias", None)
 
         self.initialize_parameters()
 
@@ -342,7 +357,10 @@ class CLIP(nn.Module):
         else:
             return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image):
+    def encode_image(self, image, return_patches: bool = False):
+        if return_patches:
+            assert isinstance(self.visual, VisionTransformer), "patch tokens require the ViT image encoder"
+            return self.visual(image.type(self.dtype), return_patches=True)
         return self.visual(image.type(self.dtype))
 
     def encode_text(self, text):
@@ -355,11 +373,17 @@ class CLIP(nn.Module):
         image_features = image_features / image_features.norm(dim=1, keepdim=True)
         text_features = text_features / text_features.norm(dim=1, keepdim=True)
 
-        logit_scale = self.logit_scale.exp()
-        logits_per_image = logit_scale * image_features @ text_features.t()
+        logits_per_image = self.logits(image_features, text_features)
         logits_per_text = logits_per_image.t()
 
         return logits_per_image, logits_per_text
+
+    def logits(self, image_features, text_features):
+        """exp(scale) * <img, txt> (+ bias) for already L2-normalised features, shape (N_img, N_txt)."""
+        logits = self.logit_scale.exp() * image_features @ text_features.t()
+        if self.logit_bias is not None:
+            logits = logits + self.logit_bias
+        return logits
 
 
 def convert_weights(model: nn.Module):

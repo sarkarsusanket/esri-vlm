@@ -1,9 +1,10 @@
 model:
+  # ---- architecture (unchanged)
   embed_dim: 512
-  image_resolution: 224
+  image_resolution: 224        # also forwarded to the datamodule
   vision_layers: 12
   vision_width: 64
-  vision_patch_size: 32
+  vision_patch_size: 32        # also forwarded to the datamodule (mask grid = resolution / patch)
   in_channels: 3
   context_length: 256
   transformer_width: 512
@@ -14,14 +15,40 @@ model:
   warmup_steps: 2000
   tokenizer_name: "openai/clip-vit-base-patch32"
 
+  # ---- losses
+  loss_type: clip              # clip | siglip   (siglip: scale=log 10, learnable bias=-10)
+  use_masks: false             # true -> load masks + region-level loss; false -> nothing mask-related runs
+  use_hard_negatives: true     # mutated dense sentences as extra negatives (needs w_dense > 0)
+  w_global: 1.0                # summary caption  <-> image CLS
+  w_dense: 1.0                 # each dense sentence <-> its image (+ hard negatives); 0 disables
+  w_region: 1.0                # masked patches <-> keyword text; only used if use_masks
+  w_keyword: 0.1               # image CLS vs "there is no <kw>" (similarity is minimised); 0 disables
+  region_min_coverage: 0.1     # a patch counts for a region if >= 10% of it is inside the mask
+  keyword_margin: null         # null: mean cosine. e.g. 0.0 -> mean(relu(cos)), stops pushing once cos <= 0
+
 data:
-  parquet_path: "/data/susanket/vlm/tbd.parquet"
+  data_dir: "/data/susanket/vlm/tbd"   # folder with image-xx.parquet, caption-xx.parquet, masks/
   image_col: "image_bytes"
-  caption_col: "scene_caption"
   batch_size: 128
   num_workers: 8
-  image_resolution: 224
   val_fraction: 0.1
+  split_seed: 0
+  # dense captions / hard negatives
+  dense_max_sentences: 8
+  hard_neg_per_image: 3        # sentences per image that get a mutated twin
+  hard_neg_mut_count: 1        # edits per mutated sentence
+  hard_neg_hardness: 0.5
+  # negated keywords
+  keywords_per_image: 3
+  keyword_template: "there is no {}"
+  # regions
+  mask_subdir: "masks"
+  max_regions_per_image: 8
+  region_template: "{}"
+  # augmentation
+  crop_scale: [0.5, 1.0]       # torchvision default was (0.08, 1): tiny crops break caption <-> image alignment
+  hflip_prob: 0.0              # dense captions mention north/east/left/right; flipping makes them false
+  row_group_cache: 4
 
 trainer:
   max_epochs: 100
