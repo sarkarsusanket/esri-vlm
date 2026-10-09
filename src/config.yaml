@@ -16,7 +16,7 @@ model:
   tokenizer_name: "openai/clip-vit-base-patch32"
 
   # ---- losses
-  loss_type: clip              # clip | siglip   (siglip: scale=log 10, learnable bias=-10)
+  loss_type: siglip              # clip | siglip   (siglip: scale=log 10, learnable bias=-10)
   use_masks: false             # true -> load masks + region-level loss; false -> nothing mask-related runs
   use_hard_negatives: true     # mutated dense sentences as extra negatives (needs w_dense > 0)
   w_global: 1.0                # summary caption  <-> image CLS
@@ -27,9 +27,9 @@ model:
   keyword_margin: null         # null: mean cosine. e.g. 0.0 -> mean(relu(cos)), stops pushing once cos <= 0
 
 data:
-  data_dir: "/data/susanket/vlm/tbd"   # folder with image-xx.parquet, caption-xx.parquet, masks/
+  data_dir: "/data/susanket/vlm/images3"   # folder with image-xx.parquet, caption-xx.parquet, masks/
   image_col: "image_bytes"
-  batch_size: 128
+  batch_size: 64
   num_workers: 8
   val_fraction: 0.1
   split_seed: 0

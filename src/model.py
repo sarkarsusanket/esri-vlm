@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = "1,2"
+os.environ['CUDA_VISIBLE_DEVICES'] = "1"
 
 from collections import OrderedDict
 from typing import Tuple, Union, Optional

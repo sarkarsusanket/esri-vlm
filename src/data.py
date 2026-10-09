@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = "1,2"
+os.environ['CUDA_VISIBLE_DEVICES'] = "1"
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # tokenizing happens inside dataloader workers
 
 from typing import Any, Dict, List, Optional, Tuple

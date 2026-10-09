@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = "1,2"
+os.environ['CUDA_VISIBLE_DEVICES'] = "1"
 
 import csv
 import math
@@ -78,7 +78,7 @@ class CLIPLightningModule(pl.LightningModule):
             transformer_layers=transformer_layers,
             **logit_kwargs,
         )
-        print(self.model)
+        # print(self.model)
 
         self.pair_loss = build_pair_loss(loss_type)
         self.keyword_loss = NegatedKeywordLoss(margin=keyword_margin)

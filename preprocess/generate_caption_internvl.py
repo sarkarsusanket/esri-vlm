@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import os
 if "CUDA_VISIBLE_DEVICES" not in os.environ:
-    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import argparse
 import io
