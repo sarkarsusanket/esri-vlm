@@ -21,12 +21,20 @@ DENSE = ("A red roof house has a swimming pool to the north. Several cars are pa
          "The field is green. Dense forest covers the east side.")
 
 
-def make_repo(root: Path):
+def make_repo(root: Path, with_emb: bool = False, skip_emb=()):
     (root / "masks").mkdir(parents=True)
     for sh, n in (("00", 10), ("01", 7)):
         names = [f"{sh}_{i}.jpg" for i in range(n)]
         pd.DataFrame({"image_bytes": [png(300 + 10 * i, 200, (i * 20 % 255, 10, 10)) for i in range(n)],
                       "file_name": names}).to_parquet(root / f"image-{sh}.parquet", row_group_size=4)
+        if with_emb:  # preprocessed DINOv2 [CLS + patch] embs: grid 7 -> 49 patches, dim 8
+            emb_dir = root / f"image-{sh}"
+            emb_dir.mkdir()
+            for fn in names:
+                if fn in skip_emb:
+                    continue
+                rng = np.random.default_rng(abs(hash(fn)) % 2 ** 32)
+                np.save(emb_dir / f"{Path(fn).stem}.npy", rng.standard_normal((50, 8)).astype(np.float32))
         # caption parquet in a different row order, one extra file without image, one empty summary
         cap_names = names[::-1] + ["ghost.jpg"]
         pd.DataFrame({"file_name": cap_names,
@@ -133,6 +141,37 @@ def test_index_and_samples():
         # toggles really switch work off
         off = SampleBuilder(idx, SampleConfig(train=False, use_dense=False, use_keywords=False, use_masks=False)).build(0)
         assert off["dense"] == [] and off["hard_negs"] == [] and off["neg_keywords"] == [] and off["region_kws"] == []
+
+
+def test_precomputed_embeddings():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        make_repo(root, with_emb=True, skip_emb={"01_2.jpg"})
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            idx = ShardIndex(str(root), precomputed=True, use_masks=True, row_group_cache=2)
+        # 01_2 has no .npy -> dropped on top of the usual empty-summary / ghost drops
+        assert len(idx) == (10 - 1) + (7 - 1) - 1, len(idx)
+        assert "01_2.jpg" not in {r.file_name for r in idx.records}
+        # nothing is read from the image parquet: bytes access is never touched
+        for rec in idx.records:
+            assert (idx.shards[rec.shard].emb_dir / f"{Path(rec.file_name).stem}.npy").exists()
+
+        b = SampleBuilder(idx, SampleConfig(train=False, use_masks=True))
+        s = b.build(0)
+        assert "image" not in s and s["image_emb"].shape == (50, 8) and s["image_emb"].dtype == np.float32
+        # full mask (no crop / no flip): 'road' still covers the left third of the patch grid
+        k = s["region_kws"].index("road")
+        assert s["region_cov"][k][:, :3].mean() > 0.9 and s["region_cov"][k][:, 5:].mean() < 0.1
+
+        # a mismatching token count is rejected with a clear error
+        i0 = next(i for i, r in enumerate(idx.records) if r.file_name == "00_1.jpg")
+        np.save(idx.shards[0].emb_dir / "00_1.npy", np.zeros((17, 8), np.float32))
+        try:
+            b.build(i0)
+            assert False, "expected ValueError for a wrong precomputed embedding shape"
+        except ValueError:
+            pass
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+from transformers import AutoModel
 
 
 class Bottleneck(nn.Module):
@@ -274,7 +275,7 @@ class TextTransformer(nn.Module):
         return x
 
 
-class CLIP(nn.Module):
+class OpenAICLIP(nn.Module):
     def __init__(
         self,
         embed_dim: int = 512,
@@ -433,7 +434,7 @@ def build_model(state_dict: dict):
     transformer_heads = transformer_width // 64
     transformer_layers = len(set(k.split(".")[2]) for k in state_dict if k.startswith("transformer.resblocks"))
 
-    model = CLIP(
+    model = OpenAICLIP(
         embed_dim=embed_dim,
         image_resolution=image_resolution,
         vision_layers=vision_layers,
@@ -453,3 +454,252 @@ def build_model(state_dict: dict):
     convert_weights(model)
     model.load_state_dict(state_dict)
     return model.eval()
+
+
+# =============================================================================
+# Pretrained towers: Qwen3 text encoder + DINOv2 image encoder.
+#
+# Both backbones stay frozen (by default) and only a linear projection into the
+# shared `embed_dim` space is trained, so the embeddings are "just projected"
+# from each tower.
+# =============================================================================
+
+DINOV2_REPO = "facebookresearch/dinov2"
+
+# hidden (embed) dim of the DINOv2 backbones, needed to build the projection when the backbone
+# itself is not loaded (precomputed embeddings). Keys are the torch.hub entrypoints.
+DINOV2_HIDDEN_DIM = {
+    "dinov2_vits14": 384,
+    "dinov2_vitb14": 768,
+    "dinov2_vitl14": 1024,
+    "dinov2_vitg14": 1536,
+}
+
+
+def pool_tokens(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor,
+                pooling_mode: str = "last_eos") -> torch.Tensor:
+    """Pool token states the same way as the Qwen3 embedding notebooks."""
+    mode = pooling_mode.lower()
+
+    if mode in ("first_eos", "bos", "cls"):
+        return last_hidden_states[:, 0]
+
+    if mode in ("last_eos", "eos"):
+        left_padding = bool(attention_mask[:, -1].sum() == attention_mask.shape[0])
+        if left_padding:
+            return last_hidden_states[:, -1]
+        sequence_lengths = attention_mask.sum(dim=1) - 1
+        batch_size = last_hidden_states.shape[0]
+        return last_hidden_states[
+            torch.arange(batch_size, device=last_hidden_states.device), sequence_lengths
+        ]
+
+    if mode == "mean":
+        mask = attention_mask.unsqueeze(-1).expand(last_hidden_states.size()).to(last_hidden_states.dtype)
+        summed = torch.sum(last_hidden_states * mask, dim=1)
+        return summed / torch.clamp(mask.sum(dim=1), min=1e-9)
+
+    raise ValueError(f"Unsupported pooling mode '{pooling_mode}'.")
+
+
+class DINOv2ImageTower(nn.Module):
+    """DINOv2 ViT backbone (frozen by default) + a trainable linear projection.
+
+    ``forward`` returns the projected CLS token; with ``return_patches=True`` it also
+    returns the projected patch tokens (both in the shared embedding space).
+
+    With ``precomputed=True`` the backbone is not loaded at all: ``forward`` instead expects
+    the ``(B, 1 + P, hidden_dim)`` [CLS + patch] features produced by
+    ``preprocess/generate_dino_emb.py`` and only projects them. This must go together with a
+    frozen image tower (there is no backbone left to fine-tune).
+    """
+
+    def __init__(self, model_name: str = "dinov2_vits14", embed_dim: int = 512,
+                 image_resolution: int = 224, freeze: bool = True, precomputed: bool = False):
+        super().__init__()
+        self.precomputed = precomputed
+        self.model_name = model_name
+        self.image_resolution = image_resolution
+        self.patch_size = 14  # every DINOv2 entrypoint uses patch size 14
+
+        if precomputed:
+            if not freeze:
+                raise ValueError("precomputed_image=True requires freeze_image_tower=True "
+                                 "(there is no DINOv2 backbone to fine-tune)")
+            key = model_name.replace("_reg", "")  # the register variants share the exact same width
+            if key not in DINOV2_HIDDEN_DIM:
+                raise ValueError(f"unknown DINOv2 model {model_name!r}; known: "
+                                 f"{sorted(DINOV2_HIDDEN_DIM)} (+ their _reg variants)")
+            self.hidden_dim = DINOV2_HIDDEN_DIM[key]
+            self.backbone = None
+        else:
+            try:
+                backbone = torch.hub.load(DINOV2_REPO, model_name, trust_repo=True)
+            except TypeError:  # older torch without trust_repo
+                backbone = torch.hub.load(DINOV2_REPO, model_name)
+            self.backbone = backbone
+            self.hidden_dim = int(self.backbone.embed_dim)
+            self.patch_size = int(self.backbone.patch_size)
+
+        self.freeze = freeze
+        self.proj = nn.Linear(self.hidden_dim, embed_dim, bias=False)
+        nn.init.normal_(self.proj.weight, std=0.02)
+
+        if freeze and self.backbone is not None:
+            for p in self.backbone.parameters():
+                p.requires_grad_(False)
+            self.backbone.eval()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze and self.backbone is not None:
+            self.backbone.eval()
+        return self
+
+    def forward(self, x: torch.Tensor, return_patches: bool = False):
+        dtype = self.proj.weight.dtype
+
+        if self.precomputed:
+            if x.ndim != 3 or x.shape[-1] != self.hidden_dim:
+                raise ValueError(
+                    f"precomputed DINOv2 features must have shape (B, 1 + P, {self.hidden_dim}), "
+                    f"got {tuple(x.shape)}")
+            cls = self.proj(x[:, 0].to(dtype))
+            if return_patches:
+                return cls, self.proj(x[:, 1:].to(dtype))
+            return cls
+
+        feats = self.backbone.forward_features(x)
+        cls = feats["x_norm_clstoken"]
+        if self.freeze:
+            cls = cls.detach()
+        cls = self.proj(cls.to(dtype))
+
+        if return_patches:
+            patches = feats["x_norm_patchtokens"]
+            if self.freeze:
+                patches = patches.detach()
+            return cls, self.proj(patches.to(dtype))
+        return cls
+
+
+class QwenTextTower(nn.Module):
+    """Qwen3-Embedding backbone (frozen by default) + a trainable linear projection."""
+
+    def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B", embed_dim: int = 512,
+                 context_length: int = 256, pooling: str = "last_eos", freeze: bool = True,
+                 pad_token_id: Optional[int] = None):
+        super().__init__()
+        self.backbone = AutoModel.from_pretrained(model_name)
+        self.freeze = freeze
+        self.hidden_dim = int(self.backbone.config.hidden_size)
+        self.context_length = context_length
+        self.pooling = pooling
+        self.pad_token_id = pad_token_id
+
+        self.proj = nn.Linear(self.hidden_dim, embed_dim, bias=False)
+        nn.init.normal_(self.proj.weight, std=0.02)
+
+        if freeze:
+            for p in self.backbone.parameters():
+                p.requires_grad_(False)
+            self.backbone.eval()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze:
+            self.backbone.eval()
+        return self
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
+        if attention_mask is None:
+            if self.pad_token_id is None:
+                attention_mask = torch.ones_like(input_ids)
+            else:
+                attention_mask = (input_ids != self.pad_token_id).long()
+
+        hidden = self.backbone(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        if self.freeze:
+            hidden = hidden.detach()
+        pooled = pool_tokens(hidden, attention_mask, self.pooling)
+        return self.proj(pooled.to(self.proj.weight.dtype))
+
+
+class CLIP(nn.Module):
+    """Image/text towers with a shared embedding space.
+
+    The image tower is DINOv2, the text tower is Qwen3-Embedding; each backbone output is
+    linearly projected into `embed_dim`. Backbones are frozen by default.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 512,
+        image_resolution: int = 224,
+        text_model_name: str = "Qwen/Qwen3-Embedding-0.6B",
+        image_model_name: str = "dinov2_vits14",
+        text_pooling: str = "last_eos",
+        context_length: int = 256,
+        freeze_text_tower: bool = True,
+        freeze_image_tower: bool = True,
+        precomputed_image: bool = False,
+        pad_token_id: Optional[int] = None,
+        # logit scale / bias (SigLIP uses scale=log(10) and a learnable bias=-10)
+        logit_scale_init: float = float(np.log(1 / 0.07)),
+        use_logit_bias: bool = False,
+        logit_bias_init: float = -10.0,
+    ):
+        super().__init__()
+
+        self.visual = DINOv2ImageTower(
+            model_name=image_model_name,
+            embed_dim=embed_dim,
+            image_resolution=image_resolution,
+            freeze=freeze_image_tower,
+            precomputed=precomputed_image,
+        )
+        self.transformer = QwenTextTower(
+            model_name=text_model_name,
+            embed_dim=embed_dim,
+            context_length=context_length,
+            pooling=text_pooling,
+            freeze=freeze_text_tower,
+            pad_token_id=pad_token_id,
+        )
+
+        self.logit_scale = nn.Parameter(torch.ones([]) * logit_scale_init)
+        if use_logit_bias:
+            self.logit_bias = nn.Parameter(torch.ones([]) * logit_bias_init)
+        else:
+            self.register_parameter("logit_bias", None)
+
+    @property
+    def dtype(self):
+        return self.visual.proj.weight.dtype
+
+    def encode_image(self, image, return_patches: bool = False):
+        return self.visual(image.type(self.dtype), return_patches=return_patches)
+
+    def encode_text(self, tokens):
+        if isinstance(tokens, dict):
+            return self.transformer(tokens["input_ids"], tokens["attention_mask"])
+        return self.transformer(tokens)
+
+    def forward(self, image, text):
+        image_features = self.encode_image(image)
+        text_features = self.encode_text(text)
+
+        image_features = image_features / image_features.norm(dim=1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=1, keepdim=True)
+
+        logits_per_image = self.logits(image_features, text_features)
+        logits_per_text = logits_per_image.t()
+
+        return logits_per_image, logits_per_text
+
+    def logits(self, image_features, text_features):
+        """exp(scale) * <img, txt> (+ bias) for already L2-normalised features, shape (N_img, N_txt)."""
+        logits = self.logit_scale.exp() * image_features @ text_features.t()
+        if self.logit_bias is not None:
+            logits = logits + self.logit_bias
+        return logits

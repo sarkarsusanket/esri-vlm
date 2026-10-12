@@ -2,10 +2,19 @@
 
 Layout (xx = shard id)::
 
-    image-xx.parquet          image_bytes, file_name
+    image-xx.parquet          image_bytes, file_name   (image_bytes only needed in bytes mode)
+    image-xx/<file_stem>.npy  precomputed DINOv2 [CLS + patch] tokens, (1 + P, D) float32
+                              (see preprocess/generate_dino_emb.py)
     caption-xx.parquet        file_name, summary, dense_caption, key_elements
     masks/mask-xx.csv         file_name, key_elements   (subset that has masks, in mask order)
     masks/mask-xx/<file_name>.npy   (K, H, W) masks, K == len(csv key_elements)
+
+Two ingestion modes, selected by ``ShardIndex(precomputed=...)``:
+
+* ``precomputed=True``  samples carry ``image_emb`` loaded from ``image-xx/``; image bytes are
+  never read and no crop / flip augmentation is possible (the embeddings were computed once
+  from the whole square-resized image). Records without an .npy are skipped.
+* ``precomputed=False`` samples carry a decoded, cropped ``image`` tensor as before.
 """
 from __future__ import annotations
 
@@ -26,8 +35,9 @@ from utils.crops import center_square_box, masks_to_grid, sample_resized_crop_bo
 from utils.negatives import NegativeCaptionGenerator
 from utils.text import parse_key_elements, split_sentences
 
-MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
-STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+# ImageNet statistics, matching the DINOv2 image tower's preprocessing.
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
 class Record(NamedTuple):
@@ -46,14 +56,17 @@ class ShardInfo:
     image_path: Path
     mask_dir: Path
     rg_ends: np.ndarray  # cumulative row count at the end of every row group
+    emb_dir: Path  # precomputed DINOv2 embeddings for this shard (image-xx/)
 
 
 class ShardIndex:
     def __init__(self, root: str, image_col: str = "image_bytes", use_masks: bool = False,
-                 mask_subdir: str = "masks", row_group_cache: int = 4, verbose: bool = True):
+                 mask_subdir: str = "masks", row_group_cache: int = 4,
+                 precomputed: bool = False, verbose: bool = True):
         self.root = Path(root)
         self.image_col = image_col
         self.use_masks = use_masks
+        self.precomputed = precomputed
         self.row_group_cache = row_group_cache
         self.shards: List[ShardInfo] = []
         self.records: List[Record] = []
@@ -65,7 +78,7 @@ class ShardIndex:
         if not image_files:
             raise FileNotFoundError(f"no image-*.parquet found in {self.root}")
 
-        n_missing_img = n_empty = n_masked = 0
+        n_missing_img = n_empty = n_masked = n_missing_emb = 0
         for p in image_files:
             name = p.stem[len("image-"):]
             cap_path = self.root / f"caption-{name}.parquet"
@@ -83,6 +96,15 @@ class ShardIndex:
                 warnings.warn(f"{p.name}: row groups have >4096 rows; random access re-reads a whole "
                               f"row group per cache miss. Re-write with ~256-1024 rows/group for speed.")
 
+            emb_dir = self.root / p.stem
+            emb_stems: set = set()
+            if precomputed:
+                if emb_dir.is_dir():
+                    # single scandir beats a Path.exists() per record on million-row shards
+                    emb_stems = {e.stem for e in emb_dir.iterdir() if e.suffix == ".npy"}
+                else:
+                    warnings.warn(f"{emb_dir.name}/ missing: shard {name} has no precomputed embeddings")
+
             mask_map: Dict[str, Tuple[str, ...]] = {}
             if use_masks:
                 csv_path = self.root / mask_subdir / f"mask-{name}.csv"
@@ -94,7 +116,8 @@ class ShardIndex:
                     warnings.warn(f"{csv_path} missing: shard {name} has no masks")
 
             sid = len(self.shards)
-            self.shards.append(ShardInfo(name, p, self.root / mask_subdir / f"mask-{name}", rg_ends))
+            self.shards.append(ShardInfo(name, p, self.root / mask_subdir / f"mask-{name}",
+                                         rg_ends, emb_dir))
 
             caps = pd.read_parquet(cap_path, columns=["file_name", "summary", "dense_caption", "key_elements"])
             for fn, summ, dense, ke in zip(caps["file_name"], caps["summary"], caps["dense_caption"],
@@ -103,6 +126,9 @@ class ShardIndex:
                 row = row_of.get(fn)
                 if row is None:
                     n_missing_img += 1
+                    continue
+                if precomputed and Path(fn).stem not in emb_stems:
+                    n_missing_emb += 1
                     continue
                 summ = summ if isinstance(summ, str) else ""
                 if not summ.strip():
@@ -116,8 +142,12 @@ class ShardIndex:
 
         if verbose:
             print(f"[ShardIndex] {len(self.shards)} shards, {len(self.records)} samples "
-                  f"(dropped: {n_missing_img} without image, {n_empty} without summary)"
-                  + (f", {n_masked} with mask entries" if use_masks else ""))
+                  f"(dropped: {n_missing_img} without image, {n_empty} without summary"
+                  + (f", {n_missing_emb} without precomputed embedding" if precomputed else "") + ")"
+                  + (f"; {n_masked} with mask entries" if use_masks else ""))
+            if precomputed and n_missing_emb:
+                print(f"[ShardIndex] dropped samples get embeddings once preprocess/generate_dino_emb.py "
+                      f"finishes; re-instantiate the index to pick them up")
 
     def __len__(self) -> int:
         return len(self.records)
@@ -149,6 +179,22 @@ class ShardIndex:
         rg = int(np.searchsorted(ends, rec.row, side="right"))
         start = 0 if rg == 0 else int(ends[rg - 1])
         return self._row_group_column(rec.shard, rg)[rec.row - start].as_py()
+
+    # ------------------------------------------------------- precomputed DINOv2
+    def dino_emb(self, rec: Record) -> np.ndarray:
+        """(1 + P, D) float32 [CLS + patch] embedding saved by preprocess/generate_dino_emb.py."""
+        d = self.shards[rec.shard].emb_dir
+        p = d / f"{Path(rec.file_name).stem}.npy"
+        if not p.exists():
+            for cand in (rec.file_name, Path(rec.file_name).stem):  # be lenient about odd file_name
+                alt = d / f"{cand}.npy"
+                if alt.exists():
+                    p = alt
+                    break
+            else:
+                raise FileNotFoundError(f"{p} not found (shard {self.shards[rec.shard].name})")
+        return np.load(p)
+
 
     # ------------------------------------------------------------------- masks
     def load_masks(self, rec: Record) -> Optional[np.ndarray]:
@@ -213,22 +259,36 @@ class SampleBuilder:
         # train: fresh randomness every call; val: deterministic per sample
         rng = random.Random(random.getrandbits(64) if cfg.train else 7919 * record_idx + 17)
 
-        img = Image.open(io.BytesIO(self.index.image_bytes(rec))).convert("RGB")
-        iw, ih = img.size
-        if cfg.train:
-            box = sample_resized_crop_box(iw, ih, cfg.crop_scale, rng=rng)
-            flip = rng.random() < cfg.hflip_prob
+        precomputed = self.index.precomputed
+        box = flip = iw = ih = None
+        if precomputed:
+            emb = self.index.dino_emb(rec)
+            n_tok = emb.shape[0] if emb.ndim == 2 else -1
+            if n_tok != self.grid * self.grid + 1:
+                raise ValueError(
+                    f"{rec.file_name}: precomputed embedding has shape {emb.shape}, expected "
+                    f"({self.grid * self.grid + 1}, D) for image_resolution={cfg.image_resolution} / "
+                    f"patch_size={cfg.patch_size}. Re-run preprocess/generate_dino_emb.py or fix the config.")
+            out = {"image_emb": np.ascontiguousarray(emb, dtype=np.float32), "summary": rec.summary,
+                   "dense": [], "hard_negs": [], "neg_keywords": [], "region_kws": [],
+                   "region_cov": np.zeros((0, self.grid, self.grid), np.float32)}
         else:
-            box, flip = center_square_box(iw, ih), False
-        l, t, cw, ch = box
-        res = cfg.image_resolution
-        img = img.crop((l, t, l + cw, t + ch)).resize((res, res), Image.Resampling.BICUBIC)
-        if flip:
-            img = img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-        arr = (np.asarray(img, dtype=np.float32) / 255.0 - MEAN) / STD
-        out = {"image": np.ascontiguousarray(arr.transpose(2, 0, 1)), "summary": rec.summary,
-               "dense": [], "hard_negs": [], "neg_keywords": [], "region_kws": [],
-               "region_cov": np.zeros((0, self.grid, self.grid), np.float32)}
+            img = Image.open(io.BytesIO(self.index.image_bytes(rec))).convert("RGB")
+            iw, ih = img.size
+            if cfg.train:
+                box = sample_resized_crop_box(iw, ih, cfg.crop_scale, rng=rng)
+                flip = rng.random() < cfg.hflip_prob
+            else:
+                box, flip = center_square_box(iw, ih), False
+            l, t, cw, ch = box
+            res = cfg.image_resolution
+            img = img.crop((l, t, l + cw, t + ch)).resize((res, res), Image.Resampling.BICUBIC)
+            if flip:
+                img = img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+            arr = (np.asarray(img, dtype=np.float32) / 255.0 - MEAN) / STD
+            out = {"image": np.ascontiguousarray(arr.transpose(2, 0, 1)), "summary": rec.summary,
+                   "dense": [], "hard_negs": [], "neg_keywords": [], "region_kws": [],
+                   "region_cov": np.zeros((0, self.grid, self.grid), np.float32)}
 
         if cfg.use_dense:
             sents = split_sentences(rec.dense_caption)
@@ -252,7 +312,13 @@ class SampleBuilder:
             masks = self.index.load_masks(rec)
             if masks is not None:
                 sel = [k for k, w in enumerate(rec.mask_keywords) if w]
-                cov = masks_to_grid(masks, sel, box, (iw, ih), self.grid, flip)
+                if precomputed:
+                    # embeddings came from the whole square-resized image: no crop, no flip, so
+                    # the region grid is just the full mask mapped onto the patch grid.
+                    hm, wm = masks.shape[-2:]
+                    cov = masks_to_grid(masks, sel, (0, 0, wm, hm), (wm, hm), self.grid, False)
+                else:
+                    cov = masks_to_grid(masks, sel, box, (iw, ih), self.grid, flip)
                 vis = [j for j in range(len(sel)) if cov[j].max() > 0]  # still visible after the crop
                 if len(vis) > cfg.max_regions_per_image:
                     vis = sorted(rng.sample(vis, cfg.max_regions_per_image))

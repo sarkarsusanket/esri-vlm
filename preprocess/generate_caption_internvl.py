@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Fastest dense captioning with InternVL3.5 on a single H100 using vLLM.
 
+Batch processes a directory/repo of parquet files (e.g., image-00.parquet -> caption-00.parquet).
+
 Why it's fast:
 - Continuous batching + paged KV cache (hundreds of sequences in flight)
 - Prefix caching (the long shared prompt is computed once)
 - Image decode in a thread pool, streamed in chunks (bounded RAM)
-- Resumable: progress appended to JSONL, final Parquet/JSONL written at the end
+- Resumable per-file and per-batch: progress appended to JSONL
 - Failed rows are automatically retried once with light sampling
 
-Install:  pip install vllm pyarrow pandas pillow tqdm
+Install:
+    pip install vllm pyarrow pandas pillow tqdm
+
 Run:
-  python caption_vllm.py --input_parquet in.parquet --output_path out.parquet
+    python caption_vllm.py --input_dir /path/to/parquet_dir
 """
 from __future__ import annotations
 
@@ -95,7 +99,7 @@ def decode(item: tuple[str, Any]):
         return name, None, str(e)
 
 
-def iter_chunks(path: str, img_col: str, name_col: str, chunk: int, skip: set[str]):
+def iter_chunks(path: Path, img_col: str, name_col: str, chunk: int, skip: set[str]):
     pf = pq.ParquetFile(path)
     cols = [img_col] + ([name_col] if name_col in pf.schema_arrow.names else [])
     counter = 0
@@ -129,57 +133,31 @@ def run(llm, tok, sp, pil_items):
     return res
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input_parquet", required=True)
-    ap.add_argument("--output_path", required=True)
-    ap.add_argument("--image_column", default="image_bytes")
-    ap.add_argument("--file_name_column", default="file_name")
-    ap.add_argument("--model_name", default="OpenGVLab/InternVL3_5-8B")
-    ap.add_argument("--chunk_size", type=int, default=1024, help="Images submitted to vLLM at once.")
-    ap.add_argument("--max_tiles", type=int, default=6,
-                    help="Max dynamic tiles per image (12=orig quality, 6~2x faster, 4 fastest).")
-    ap.add_argument("--max_new_tokens", type=int, default=400)
-    ap.add_argument("--max_num_seqs", type=int, default=256)
-    ap.add_argument("--gpu_mem_util", type=float, default=0.92)
-    ap.add_argument("--decode_threads", type=int, default=32)
-    args = ap.parse_args()
-
-    from vllm import LLM, SamplingParams
-
-    out = Path(args.output_path)
-    progress = out.with_suffix(".progress.jsonl")
+def process_single_parquet(
+    input_file: Path,
+    output_file: Path,
+    llm: Any,
+    tok: Any,
+    sp: Any,
+    sp_retry: Any,
+    args: argparse.Namespace,
+    pool: ThreadPoolExecutor,
+) -> None:
+    logging.info("Starting processing: %s -> %s", input_file.name, output_file.name)
+    progress = output_file.with_suffix(".progress.jsonl")
     done: dict[str, dict] = {}
     if progress.exists():
         for line in progress.read_text().splitlines():
-            r = json.loads(line)
-            done[r["file_name"]] = r
-        logging.info("Resuming: %d rows already done", len(done))
+            if line.strip():
+                r = json.loads(line)
+                done[r["file_name"]] = r
+        logging.info("Resuming %s: %d rows already done", input_file.name, len(done))
 
-    llm = LLM(
-        model=args.model_name,
-        trust_remote_code=True,
-        dtype="bfloat16",
-        max_model_len=8192,
-        gpu_memory_utilization=args.gpu_mem_util,
-        max_num_seqs=args.max_num_seqs,
-        max_num_batched_tokens=32768,
-        enable_prefix_caching=True,
-        limit_mm_per_prompt={"image": 1},
-        # mm_processor_kwargs={"max_dynamic_patch": args.max_tiles},
-    )
-    tok = llm.get_tokenizer()
-    sp = SamplingParams(temperature=0.0, max_tokens=args.max_new_tokens)
-    sp_retry = SamplingParams(temperature=0.3, top_p=0.9, max_tokens=args.max_new_tokens + 200)
+    total = pq.ParquetFile(input_file).metadata.num_rows
+    pbar = tqdm(total=total, initial=len(done), desc=f"Captioning {input_file.name}")
 
-    total = pq.ParquetFile(args.input_parquet).metadata.num_rows
-    pbar = tqdm(total=total, initial=len(done), desc="Captioning")
-
-    with ThreadPoolExecutor(args.decode_threads) as pool, open(progress, "a") as pf:
-        # Prefetch-decode next chunk while GPU works on the current one
-        chunks = iter_chunks(args.input_parquet, args.image_column,
-                             args.file_name_column, args.chunk_size, set(done))
-        pending = None
+    with open(progress, "a") as pf:
+        chunks = iter_chunks(input_file, args.image_column, args.file_name_column, args.chunk_size, set(done))
         for pairs in chunks:
             decoded = list(pool.map(decode, pairs))
             ok = [(n, im) for n, im, e in decoded if im is not None]
@@ -188,7 +166,7 @@ def main() -> None:
 
             results = run(llm, tok, sp, ok) if ok else []
 
-            # one retry pass for failures (bad JSON / too short)
+            # Retry pass for failures
             imgs = dict(ok)
             retry = [(r["file_name"], imgs[r["file_name"]]) for r in results if r["status"] == "failed"]
             if retry:
@@ -202,13 +180,78 @@ def main() -> None:
             pbar.update(len(pairs))
 
     pbar.close()
+
+    # Save final Parquet output and clean up progress JSONL file
     final = pd.DataFrame(list(done.values()))
-    if str(out).endswith(".parquet"):
-        final.to_parquet(out, index=False)
-    else:
-        final.to_json(out, orient="records", lines=True)
+    final.to_parquet(output_file, index=False)
+    if progress.exists():
+        progress.unlink()
+
     n_fail = int((final["status"] == "failed").sum())
-    logging.info("Done. %d rows (%d failed) -> %s", len(final), n_fail, out)
+    logging.info("Completed %s: %d rows (%d failed) -> %s", input_file.name, len(final), n_fail, output_file)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input_dir", required=True, help="Directory containing image parquets (e.g. image-00.parquet)")
+    ap.add_argument("--image_column", default="image_bytes")
+    ap.add_argument("--file_name_column", default="file_name")
+    ap.add_argument("--model_name", default="OpenGVLab/InternVL3_5-8B")
+    ap.add_argument("--chunk_size", type=int, default=1024, help="Images submitted to vLLM at once.")
+    ap.add_argument("--max_tiles", type=int, default=6)
+    ap.add_argument("--max_new_tokens", type=int, default=400)
+    ap.add_argument("--max_num_seqs", type=int, default=256)
+    ap.add_argument("--gpu_mem_util", type=float, default=0.92)
+    ap.add_argument("--decode_threads", type=int, default=32)
+    args = ap.parse_args()
+
+    input_dir = Path(args.input_dir)
+    # Target all parquet files starting with "image-" or named "image*.parquet"
+    all_image_files = sorted(list(input_dir.glob("**/image*.parquet")))
+
+    if not all_image_files:
+        logging.warning("No image parquet files found matching 'image*.parquet' in %s", input_dir)
+        return
+
+    # Filter out files that already have completed outputs
+    pending_files = []
+    for img_path in all_image_files:
+        # e.g., image-00.parquet -> caption-00.parquet
+        output_name = img_path.name.replace("image", "caption", 1)
+        output_path = img_path.parent / output_name
+
+        if output_path.exists():
+            logging.info("Skipping finished file: %s", output_path.name)
+            continue
+        pending_files.append((img_path, output_path))
+
+    if not pending_files:
+        logging.info("All image parquets have already been processed!")
+        return
+
+    logging.info("Found %d pending parquet file(s) to process.", len(pending_files))
+
+    from vllm import LLM, SamplingParams
+
+    # Load model ONCE outside the loop to avoid reload overhead
+    llm = LLM(
+        model=args.model_name,
+        trust_remote_code=True,
+        dtype="bfloat16",
+        max_model_len=8192,
+        gpu_memory_utilization=args.gpu_mem_util,
+        max_num_seqs=args.max_num_seqs,
+        max_num_batched_tokens=32768,
+        enable_prefix_caching=True,
+        limit_mm_per_prompt={"image": 1},
+    )
+    tok = llm.get_tokenizer()
+    sp = SamplingParams(temperature=0.0, max_tokens=args.max_new_tokens)
+    sp_retry = SamplingParams(temperature=0.3, top_p=0.9, max_tokens=args.max_new_tokens + 200)
+
+    with ThreadPoolExecutor(args.decode_threads) as pool:
+        for input_file, output_file in pending_files:
+            process_single_parquet(input_file, output_file, llm, tok, sp, sp_retry, args, pool)
 
 
 if __name__ == "__main__":

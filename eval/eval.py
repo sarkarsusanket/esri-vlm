@@ -19,15 +19,15 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from transformers import CLIPTokenizer
+from transformers import AutoTokenizer
 
 sys.path.append(rf"/home/susanket/esri-vlm/src")
 from model import CLIP, build_model
 from main import CLIPLightningModule
 
 
-IMAGENET_MEAN = [0.48145466, 0.4578275, 0.40821073]
-IMAGENET_STD = [0.26862954, 0.26130258, 0.27577711]
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
 BENCHMARK_ROOT = rf"/data/susanket/vlm/eval"
 
@@ -74,12 +74,26 @@ class ImageFolderFlat(Dataset):
 def compute_image_embeddings(model: CLIP, dataloader: DataLoader, device: torch.device) -> Tuple[np.ndarray, np.ndarray]:
     """Compute normalized image embeddings for all samples."""
     model.eval()
+    # A precomputed checkpoint has no DINOv2 backbone inside; run one here to turn pixels into
+    # the [CLS + patch] features that the image tower consumes.
+    dino_backbone = None
+    if getattr(model.visual, "precomputed", False):
+        from model import DINOV2_REPO
+        try:
+            dino_backbone = torch.hub.load(DINOV2_REPO, model.visual.model_name, trust_repo=True)
+        except TypeError:
+            dino_backbone = torch.hub.load(DINOV2_REPO, model.visual.model_name)
+        dino_backbone.eval().to(device)
     all_embeddings = []
     all_labels = []
 
     with torch.no_grad():
         for images, labels, _ in dataloader:
             images = images.to(device)
+            if dino_backbone is not None:
+                feats = dino_backbone.forward_features(images)
+                images = torch.cat([feats["x_norm_clstoken"].unsqueeze(1),
+                                    feats["x_norm_patchtokens"]], dim=1)
             embeddings = model.encode_image(images)
             embeddings = F.normalize(embeddings, dim=-1)
             all_embeddings.append(embeddings.cpu().numpy())
@@ -88,25 +102,23 @@ def compute_image_embeddings(model: CLIP, dataloader: DataLoader, device: torch.
     return np.concatenate(all_embeddings, axis=0), np.concatenate(all_labels, axis=0)
 
 
-def compute_text_embeddings(model: CLIP, class_names: List[str], device: torch.device) -> np.ndarray:
+def compute_text_embeddings(model: CLIP, tokenizer, class_names: List[str], device: torch.device) -> np.ndarray:
     """Compute normalized text embeddings for class prompt strings."""
     model.eval()
     # Standard prompt template for satellite/remote sensing imagery classification
     prompts = [f"a satellite photo of {cls.replace('_', ' ')}" for cls in class_names]
 
     with torch.no_grad():
-        # Tokenize text prompts
-        tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
-        text_tokens = tokenizer(
+        enc = tokenizer(
             prompts,
             padding=True,
             truncation=True,
             max_length=model.transformer.context_length,
             return_tensors="pt",
-        ).input_ids.to(device)
+        )
+        tokens = {k: v.to(device) for k, v in enc.items() if k in ("input_ids", "attention_mask")}
 
-        # Adjust tokenize according to your model implementation
-        text_embeddings = model.encode_text(text_tokens)
+        text_embeddings = model.encode_text(tokens)
         text_embeddings = F.normalize(text_embeddings, dim=-1)
 
     return text_embeddings.cpu().numpy()
@@ -177,12 +189,12 @@ def mean_average_precision(sim_matrix: np.ndarray, targets: np.ndarray) -> float
     return ap_sum / num_queries
 
 
-def evaluate_dataset(model: CLIP, dataset: ImageFolderFlat, device: torch.device, batch_size: int = 64) -> Dict:
+def evaluate_dataset(model: CLIP, tokenizer, dataset: ImageFolderFlat, device: torch.device, batch_size: int = 64) -> Dict:
     """Evaluate Text-to-Image (T2I) retrieval performance."""
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
     img_emb, img_labels = compute_image_embeddings(model, loader, device)
-    txt_emb = compute_text_embeddings(model, dataset.class_names, device)
+    txt_emb = compute_text_embeddings(model, tokenizer, dataset.class_names, device)
 
     # Text-to-Image similarity matrix (num_classes, num_images)
     t2i_sim_matrix = txt_emb @ img_emb.T
@@ -357,8 +369,10 @@ def main():
         lightning_model.load_state_dict(ckpt["state_dict"])
         lightning_model.eval()
         model = lightning_model.model
+        tokenizer = lightning_model.tokenizer
     else:
         model = build_model(ckpt["state_dict"]).to(device)
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-Embedding-0.6B", padding_side="left")
 
     model = model.to(device)
     model.eval()
@@ -383,7 +397,7 @@ def main():
             print("SKIP (no images)")
             continue
 
-        results = evaluate_dataset(model, dataset, device, batch_size=args.batch_size)
+        results = evaluate_dataset(model, tokenizer, dataset, device, batch_size=args.batch_size)
         elapsed = time.time() - t0
         print(f"done ({elapsed:.1f}s) | images={results['num_images']} classes={results['num_classes']} "
               f"R@1={results['R@1']:.4f} R@5={results['R@5']:.4f} MAP={results['MAP']:.4f}")

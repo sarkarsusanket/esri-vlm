@@ -1,19 +1,21 @@
 model:
-  # ---- architecture (unchanged)
+  # ---- pretrained towers (embeddings are just projected into the shared space)
+  text_model_name: "Qwen/Qwen3-Embedding-0.6B"
+  image_model_name: "dinov2_vits14"     # loaded from facebookresearch/dinov2 via torch.hub
+  text_pooling: "last_eos"              # last_eos | bos | mean
+  freeze_text_tower: true               # false -> fine-tune the Qwen backbone too
+  freeze_image_tower: true              # false -> fine-tune the DINOv2 backbone too
+  precomputed_image: true               # true -> feed precomputed DINOv2 .npy embs (image-xx/ dirs);
+                                        # no DINOv2 backbone is loaded, no image bytes are decoded
+  # ---- projected embedding space
   embed_dim: 512
   image_resolution: 224        # also forwarded to the datamodule
-  vision_layers: 12
-  vision_width: 64
-  vision_patch_size: 32        # also forwarded to the datamodule (mask grid = resolution / patch)
-  in_channels: 3
+  vision_patch_size: 14        # DINOv2 ViT-S/14 (mask grid = 224 / 14 = 16)
   context_length: 256
-  transformer_width: 512
-  transformer_heads: 8
-  transformer_layers: 12
   learning_rate: 5e-4
   weight_decay: 0.1
   warmup_steps: 2000
-  tokenizer_name: "openai/clip-vit-base-patch32"
+  tokenizer_name: "Qwen/Qwen3-Embedding-0.6B"
 
   # ---- losses
   loss_type: siglip              # clip | siglip   (siglip: scale=log 10, learnable bias=-10)
@@ -27,8 +29,8 @@ model:
   keyword_margin: null         # null: mean cosine. e.g. 0.0 -> mean(relu(cos)), stops pushing once cos <= 0
 
 data:
-  data_dir: "/data/susanket/vlm/images3"   # folder with image-xx.parquet, caption-xx.parquet, masks/
-  image_col: "image_bytes"
+  data_dir: "/data/susanket/vlm/images3"   # image-xx.parquet, image-xx/<stem>.npy (DINOv2 embs), caption-xx.parquet, masks/
+  image_col: "image_bytes"   # only read when precomputed_image is false
   batch_size: 64
   num_workers: 8
   val_fraction: 0.1
@@ -45,7 +47,7 @@ data:
   mask_subdir: "masks"
   max_regions_per_image: 8
   region_template: "{}"
-  # augmentation
+  # augmentation (only applies when precomputed_image is false: precomputed embs are fixed)
   crop_scale: [0.5, 1.0]       # torchvision default was (0.08, 1): tiny crops break caption <-> image alignment
   hflip_prob: 0.0              # dense captions mention north/east/left/right; flipping makes them false
   row_group_cache: 4

@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 from lightning.pytorch.cli import LightningCLI
 from lightning.pytorch.callbacks import Callback
-from transformers import CLIPTokenizer, CLIPTextModel
+from transformers import AutoTokenizer
 
 from model import CLIP
 from loss import NegatedKeywordLoss, build_pair_loss
@@ -24,17 +24,18 @@ torch.set_float32_matmul_precision("high")
 class CLIPLightningModule(pl.LightningModule):
     def __init__(
         self,
+        # pretrained towers
+        text_model_name: str = "Qwen/Qwen3-Embedding-0.6B",
+        image_model_name: str = "dinov2_vits14",
+        text_pooling: str = "last_eos",
+        freeze_text_tower: bool = True,
+        freeze_image_tower: bool = True,
+        precomputed_image: bool = False,  # True -> datamodule feeds precomputed DINOv2 .npy embs
         # model architecture
         embed_dim: int = 512,
         image_resolution: int = 224,
-        vision_layers: int = 12,
-        vision_width: int = 64,
-        vision_patch_size: int = 32,
-        in_channels: int = 3,
+        vision_patch_size: int = 14,
         context_length: int = 256,
-        transformer_width: int = 512,
-        transformer_heads: int = 8,
-        transformer_layers: int = 12,
         # training
         learning_rate: float = 5e-4,
         weight_decay: float = 0.1,
@@ -50,16 +51,16 @@ class CLIPLightningModule(pl.LightningModule):
         region_min_coverage: float = 0.1,  # a patch belongs to a region if >= this fraction is masked
         keyword_margin: Optional[float] = None,  # None: plain mean cosine; else mean(relu(cos - margin))
         # tokenizer
-        tokenizer_name: str = "openai/clip-vit-base-patch32",
+        tokenizer_name: str = "Qwen/Qwen3-Embedding-0.6B",
     ) -> None:
         super().__init__()
 
         self.save_hyperparameters()
 
-        self.tokenizer = CLIPTokenizer.from_pretrained(tokenizer_name)
-        vocab_size = self.tokenizer.vocab_size
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, padding_side="left")
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        assert not use_masks or isinstance(vision_layers, int), "region loss needs the ViT image encoder"
         # SigLIP: scale = log(10), learnable bias = -10 (paper init); CLIP: scale = log(1/0.07), no bias
         logit_kwargs = (dict(logit_scale_init=math.log(10.0), use_logit_bias=True, logit_bias_init=-10.0)
                         if loss_type == "siglip" else {})
@@ -67,15 +68,14 @@ class CLIPLightningModule(pl.LightningModule):
         self.model = CLIP(
             embed_dim=embed_dim,
             image_resolution=image_resolution,
-            vision_layers=vision_layers,
-            vision_width=vision_width,
-            vision_patch_size=vision_patch_size,
-            in_channels=in_channels,
-            vocab_size=vocab_size,
+            text_model_name=text_model_name,
+            image_model_name=image_model_name,
+            text_pooling=text_pooling,
             context_length=context_length,
-            transformer_width=transformer_width,
-            transformer_heads=transformer_heads,
-            transformer_layers=transformer_layers,
+            freeze_text_tower=freeze_text_tower,
+            freeze_image_tower=freeze_image_tower,
+            precomputed_image=precomputed_image,
+            pad_token_id=self.tokenizer.pad_token_id,
             **logit_kwargs,
         )
         # print(self.model)
@@ -86,7 +86,7 @@ class CLIPLightningModule(pl.LightningModule):
         self.weight_decay = weight_decay
         self.warmup_steps = warmup_steps
 
-    def tokenize(self, texts: List[str]) -> torch.Tensor:
+    def tokenize(self, texts: List[str]) -> Dict[str, torch.Tensor]:
         tokens = self.tokenizer(
             texts,
             padding=True,
@@ -94,7 +94,7 @@ class CLIPLightningModule(pl.LightningModule):
             max_length=self.hparams.context_length,
             return_tensors="pt",
         )
-        return tokens.input_ids.to(self.device)
+        return {k: v.to(self.device) for k, v in tokens.items() if k in ("input_ids", "attention_mask")}
 
     def _region_embeddings(self, patches: torch.Tensor, cov: torch.Tensor):
         """Pool patch tokens inside every mask.
@@ -117,7 +117,7 @@ class CLIPLightningModule(pl.LightningModule):
 
     def common_step(self, batch, batch_idx) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         h = self.hparams
-        images = batch["images"]
+        images = batch["images"] if "images" in batch else batch["image_emb"]
         B = images.shape[0]
         use_regions = h.use_masks and h.w_region > 0 and "region_cov" in batch
 
@@ -162,7 +162,7 @@ class CLIPLightningModule(pl.LightningModule):
 
     def _shared_step(self, batch, batch_idx, stage: str):
         total, losses = self.common_step(batch, batch_idx)
-        bs = batch["images"].shape[0]
+        bs = batch["images"].shape[0] if "images" in batch else batch["image_emb"].shape[0]
         self.log(f"{stage}_loss", total, prog_bar=True, on_epoch=True, batch_size=bs)
         for name, value in losses.items():
             self.log(f"{stage}_loss_{name}", value.detach(), on_epoch=True, batch_size=bs)
@@ -220,6 +220,7 @@ class MyLightningCLI(LightningCLI):
         parser.link_arguments("model.vision_patch_size", "data.patch_size")
         parser.link_arguments("model.context_length", "data.context_length")
         parser.link_arguments("model.tokenizer_name", "data.tokenizer_name")
+        parser.link_arguments("model.precomputed_image", "data.precomputed_image")
         parser.link_arguments("model.use_masks", "data.use_masks")
         parser.link_arguments("model.use_hard_negatives", "data.use_hard_negatives")
         # a loss with weight 0 is switched off on the data side too (no tokenizing / negatives)

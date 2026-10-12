@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
-from transformers import CLIPTokenizerFast
+from transformers import AutoTokenizer
 
 import lightning.pytorch as pl
 
@@ -27,7 +27,8 @@ class AerialClipDataset(Dataset):
 
     def __getitem__(self, i: int) -> Dict[str, Any]:
         sample = self.builder.build(int(self.indices[i]))
-        sample["image"] = torch.from_numpy(sample["image"])
+        key = "image_emb" if "image_emb" in sample else "image"
+        sample[key] = torch.from_numpy(sample[key])
         return sample
 
 
@@ -36,7 +37,9 @@ class ClipCollator:
 
     Batch layout (B images)::
 
-        images          (B, 3, H, W)
+        images          (B, 3, H, W)                   raw pixels; only when image embeddings are NOT precomputed
+        image_emb       (B, 1 + P, D)                  precomputed DINOv2 [CLS + patch] tokens; preferred
+                                                        over `images` when present (only one of the two is set)
         global_tokens   (B, L)                         summary caption of every image
         dense_tokens    (Ud, L)                        UNIQUE dense sentences of the batch, followed by
         dense_pos       (B, Ud) bool                   the hard-negative sentences; pos[i, u] = sentence u
@@ -61,16 +64,20 @@ class ClipCollator:
         self.keyword_template = keyword_template
         self.region_template = region_template
 
-    def tokenize(self, texts: List[str]) -> torch.Tensor:
-        return self.tokenizer(texts, padding=True, truncation=True, max_length=self.context_length,
-                              return_tensors="pt")["input_ids"]
+    def tokenize(self, texts: List[str]) -> Dict[str, torch.Tensor]:
+        enc = self.tokenizer(texts, padding=True, truncation=True, max_length=self.context_length,
+                             return_tensors="pt")
+        return {k: enc[k] for k in ("input_ids", "attention_mask")}
 
     def __call__(self, samples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         B = len(samples)
         out: Dict[str, torch.Tensor] = {
-            "images": torch.stack([s["image"] for s in samples]),
             "global_tokens": self.tokenize([s["summary"] for s in samples]),
         }
+        if "image_emb" in samples[0]:
+            out["image_emb"] = torch.stack([s["image_emb"] for s in samples])
+        else:
+            out["images"] = torch.stack([s["image"] for s in samples])
 
         # ---- dense sentences (+ hard negatives as extra columns without positives)
         if any(s["dense"] for s in samples):
@@ -128,7 +135,8 @@ class CLIPDataModule(pl.LightningDataModule):
         image_resolution: int = 224,
         patch_size: int = 32,
         context_length: int = 256,
-        tokenizer_name: str = "openai/clip-vit-base-patch32",
+        tokenizer_name: str = "Qwen/Qwen3-Embedding-0.6B",
+        precomputed_image: bool = False,
         use_masks: bool = False,
         use_dense: bool = True,
         use_keywords: bool = True,
@@ -160,7 +168,8 @@ class CLIPDataModule(pl.LightningDataModule):
             return
         h = self.hparams
         self.index = ShardIndex(h.data_dir, image_col=h.image_col, use_masks=h.use_masks,
-                                mask_subdir=h.mask_subdir, row_group_cache=h.row_group_cache)
+                                mask_subdir=h.mask_subdir, row_group_cache=h.row_group_cache,
+                                precomputed=h.precomputed_image)
 
         perm = np.random.RandomState(h.split_seed).permutation(len(self.index))
         n_val = int(len(perm) * h.val_fraction)
@@ -179,8 +188,11 @@ class CLIPDataModule(pl.LightningDataModule):
 
         self.train_dataset = AerialClipDataset(SampleBuilder(self.index, cfg(True)), train_idx)
         self.val_dataset = AerialClipDataset(SampleBuilder(self.index, cfg(False)), val_idx)
+        tokenizer = AutoTokenizer.from_pretrained(h.tokenizer_name, padding_side="left")
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
         self.collator = ClipCollator(
-            CLIPTokenizerFast.from_pretrained(h.tokenizer_name), h.context_length,
+            tokenizer, h.context_length,
             h.image_resolution // h.patch_size, h.keyword_template, h.region_template)
 
     def train_dataloader(self) -> DataLoader:
