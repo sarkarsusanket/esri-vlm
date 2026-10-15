@@ -185,3 +185,127 @@ class NegatedKeywordLoss(nn.Module):
         if self.margin is not None:
             sims = F.relu(sims - self.margin)
         return sims.mean()
+
+
+# =============================================================================
+# Counterfactual margin / threshold / uniformity / silhouette.
+#
+# All embeddings passed in are already L2-normalised, so the dot product is the cosine
+# similarity s(.,.). `pos` / `neg` are boolean (B, U) masks over a shared pool of U texts
+# (a given text may be a positive for image a and a negative for image b).
+# =============================================================================
+
+
+def _zero(ref: torch.Tensor) -> torch.Tensor:
+    return ref.sum() * 0.0  # keeps the graph (and DDP) alive when a group is empty
+
+
+class CounterfactualMarginLoss(nn.Module):
+    r"""``mean Softplus[ (s(I, a-) - s(I, a+) + m * (1 - s(a+, a-))) / tau ]`` over all
+    positive x negative pairs of every image.
+
+    A negative that is textually close to a positive (``s(a+, a-)`` near 1) gets its margin
+    relaxed, so the model only has to separate them as much as their wording differs. Works for
+    both the dense negatives and the keyword negatives.
+    """
+
+    def __init__(self, margin: float = 0.2, tau: float = 0.1, tau_sim: float = 0.1):
+        super().__init__()
+        self.margin = margin
+        self.tau = max(tau, 1e-6)
+        # scale the text-text similarity term into [0, 1] so m does not depend on tau
+        self.tau_sim = max(tau_sim, 1e-6)
+
+    def forward(self, img_emb: torch.Tensor, txt_emb: torch.Tensor,
+                pos: torch.Tensor, neg: torch.Tensor) -> torch.Tensor:
+        B = img_emb.shape[0]
+        if txt_emb.shape[0] == 0:
+            return _zero(img_emb)
+        sim_im = img_emb @ txt_emb.t()          # (B, U)
+        sim_tt = txt_emb @ txt_emb.t()          # (U, U)
+        terms = []
+        for i in range(B):
+            p = pos[i].nonzero(as_tuple=True)[0]
+            n = neg[i].nonzero(as_tuple=True)[0]
+            if p.numel() == 0 or n.numel() == 0:
+                continue
+            s_pos = sim_im[i, p]                 # (P,)
+            s_neg = sim_im[i, n]                 # (N,)
+            cross = sim_tt[p][:, n]              # (P, N) cosine between each a+ and a-
+            margin = self.margin * (1.0 - cross / self.tau_sim)
+            terms.append(F.softplus((s_neg.unsqueeze(0) - s_pos.unsqueeze(1) + margin) / self.tau))
+        if not terms:
+            return _zero(img_emb)
+        return torch.cat([t.flatten() for t in terms]).mean()
+
+
+class ThresholdLoss(nn.Module):
+    r"""``mean_{pos} [t+ - s]+^2 + mean_{neg} [s - t-]+^2`` with ``[x]+ = max(0, x)``.
+
+    Pulls every positive similarity above ``t_pos`` and every negative similarity below ``t_neg``
+    (a margin-style hinge, but squared). Positives / negatives come from the dense and keyword
+    groups; the two sides are normalised independently.
+    """
+
+    def __init__(self, t_pos: float = 0.5, t_neg: float = 0.1):
+        super().__init__()
+        self.t_pos = t_pos
+        self.t_neg = t_neg
+
+    def forward(self, img_emb: torch.Tensor, txt_emb: torch.Tensor,
+                pos: torch.Tensor, neg: torch.Tensor) -> torch.Tensor:
+        if txt_emb.shape[0] == 0:
+            return _zero(img_emb)
+        sim = img_emb @ txt_emb.t()          # (B, U)
+        loss = _zero(img_emb)
+        pos_v = sim[pos]
+        if pos_v.numel():
+            loss = loss + F.relu(self.t_pos - pos_v).pow(2).mean()
+        neg_v = sim[neg]
+        if neg_v.numel():
+            loss = loss + F.relu(neg_v - self.t_neg).pow(2).mean()
+        return loss
+
+
+class UniformityLoss(nn.Module):
+    r"""``log E_{i != j}[ exp(-2 ||z_i - z_j||^2) ]`` (Wang & Isola).
+
+    Lower is more uniform; computed stably as ``logsumexp(-2 d^2) - log(n(n-1))``.
+    """
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        n = z.shape[0]
+        if n < 2:
+            return _zero(z)
+        d2 = torch.cdist(z, z).pow(2)
+        eye = torch.eye(n, dtype=torch.bool, device=z.device)
+        vals = (-2.0 * d2)[~eye]
+        return torch.logsumexp(vals, dim=0) - torch.log(torch.tensor(vals.numel(), dtype=z.dtype, device=z.device))
+
+
+class SilhouetteLoss(nn.Module):
+    r"""``-mean silhouette`` over embeddings ``z`` (N, D) with integer ``labels`` (N,).
+
+    a(i) is the mean distance to the other members of i's cluster, b(i) the smallest mean
+    distance to a different cluster, silhouette = (b - a) / max(a, b). Minimising the loss
+    maximises the silhouette (tight, well-separated clusters). Singleton clusters are handled
+    (a(i) = 0). Vectorised over points and clusters.
+    """
+
+    def forward(self, z: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        n = z.shape[0]
+        if n < 3 or labels.max().item() < 1:
+            return _zero(z)
+        labels = labels.to(torch.long)
+        C = int(labels.max().item()) + 1
+        D = torch.cdist(z, z)
+        M = F.one_hot(labels, C).to(z.dtype)         # (N, C) one-hot
+        counts = M.sum(0)                            # (C,)
+        sums = D @ M                                 # (N, C) sum of distances to each cluster
+        idx = torch.arange(n, device=z.device)
+        a = sums[idx, labels] / (counts[labels] - 1).clamp_min(1)   # self distance is 0
+        means = sums / counts.clamp_min(1)
+        means[idx, labels] = float("inf")            # ignore the point's own cluster for b
+        b = means.min(1).values
+        sil = (b - a) / torch.maximum(a, b).clamp_min(1e-8)
+        return -sil.mean()

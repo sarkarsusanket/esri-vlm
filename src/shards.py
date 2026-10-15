@@ -40,6 +40,13 @@ MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
+class SkipSample(Exception):
+    """Raised when a record cannot be materialised (e.g. a corrupt/truncated .npy).
+
+    The dataset catches this and moves on to another index instead of crashing the worker.
+    """
+
+
 class Record(NamedTuple):
     shard: int
     row: int  # row inside image-xx.parquet
@@ -193,7 +200,16 @@ class ShardIndex:
                     break
             else:
                 raise FileNotFoundError(f"{p} not found (shard {self.shards[rec.shard].name})")
-        return np.load(p)
+        try:
+            emb = np.load(p)
+        except (EOFError, ValueError, OSError) as e:
+            # truncated/empty/corrupt file: let the dataset skip this record
+            raise SkipSample(f"{p} could not be loaded ({e})") from e
+        if not np.isfinite(emb).all():
+            # a corrupt/partial embedding that still happens to be the right size: normalising it
+            # would produce NaNs and poison the whole run, so skip the record instead
+            raise SkipSample(f"{p} contains non-finite values")
+        return emb
 
 
     # ------------------------------------------------------------------- masks
@@ -205,7 +221,13 @@ class ShardIndex:
         for cand in (rec.file_name, Path(rec.file_name).stem):
             p = d / f"{cand}.npy"
             if p.exists():
-                arr = np.load(p, mmap_mode="r")
+                try:
+                    arr = np.load(p, mmap_mode="r")
+                except (EOFError, ValueError, OSError) as e:
+                    if self._warned_mask < 5:
+                        warnings.warn(f"{rec.file_name}: mask file {p.name} could not be loaded ({e}); skipped")
+                        self._warned_mask += 1
+                    return None
                 break
         else:
             return None
@@ -236,7 +258,12 @@ class SampleConfig:
     hard_neg_mut_count: int = 1
     hard_neg_hardness: float = 0.5
     use_keywords: bool = True
-    keywords_per_image: int = 3
+    # keyword groups: random positive combinations, absent-keyword negatives and swapped-keyword
+    # hard negatives are built across the batch inside ClipCollator (see data.py)
+    keyword_subsets: int = 4        # positive combos sampled per image
+    keyword_negs: int = 4           # absent single keywords used as negatives per image
+    keyword_hard_negs: int = 3      # hard negatives (positive combo with swapped keywords) per image
+    keyword_hard_neg_swap: int = 1  # keywords replaced when building a hard negative
     use_masks: bool = False
     max_regions_per_image: int = 8
 
@@ -270,7 +297,7 @@ class SampleBuilder:
                     f"({self.grid * self.grid + 1}, D) for image_resolution={cfg.image_resolution} / "
                     f"patch_size={cfg.patch_size}. Re-run preprocess/generate_dino_emb.py or fix the config.")
             out = {"image_emb": np.ascontiguousarray(emb, dtype=np.float32), "summary": rec.summary,
-                   "dense": [], "hard_negs": [], "neg_keywords": [], "region_kws": [],
+                   "dense": [], "dense_text": "", "hard_negs": [], "keywords": [], "region_kws": [],
                    "region_cov": np.zeros((0, self.grid, self.grid), np.float32)}
         else:
             img = Image.open(io.BytesIO(self.index.image_bytes(rec))).convert("RGB")
@@ -287,10 +314,11 @@ class SampleBuilder:
                 img = img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
             arr = (np.asarray(img, dtype=np.float32) / 255.0 - MEAN) / STD
             out = {"image": np.ascontiguousarray(arr.transpose(2, 0, 1)), "summary": rec.summary,
-                   "dense": [], "hard_negs": [], "neg_keywords": [], "region_kws": [],
+                   "dense": [], "dense_text": "", "hard_negs": [], "keywords": [], "region_kws": [],
                    "region_cov": np.zeros((0, self.grid, self.grid), np.float32)}
 
         if cfg.use_dense:
+            out["dense_text"] = rec.dense_caption.strip()
             sents = split_sentences(rec.dense_caption)
             if len(sents) > cfg.dense_max_sentences:
                 sents = [sents[i] for i in sorted(rng.sample(range(len(sents)), cfg.dense_max_sentences))]
@@ -305,8 +333,9 @@ class SampleBuilder:
                         out["hard_negs"].append(r["negative"].strip())
 
         if cfg.use_keywords:
-            pool = sorted({k for k in rec.key_elements if k})
-            out["neg_keywords"] = rng.sample(pool, min(cfg.keywords_per_image, len(pool)))
+            # the keywords that are actually present in this image; ClipCollator turns them into
+            # positive combinations, absent-keyword negatives and swapped-keyword hard negatives
+            out["keywords"] = sorted({k for k in rec.key_elements if k})
 
         if cfg.use_masks and rec.mask_keywords:
             masks = self.index.load_masks(rec)

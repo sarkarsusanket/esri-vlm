@@ -26,7 +26,7 @@ trainer:
   enable_checkpointing: null
   enable_progress_bar: null
   enable_model_summary: null
-  accumulate_grad_batches: 16
+  accumulate_grad_batches: 4
   gradient_clip_val: null
   gradient_clip_algorithm: null
   deterministic: null
@@ -49,7 +49,7 @@ model:
   freeze_text_tower: true
   freeze_image_tower: true
   precomputed_image: true
-  embed_dim: 512
+  embed_dim: 256
   image_resolution: 224
   vision_patch_size: 14
   context_length: 256
@@ -59,26 +59,36 @@ model:
   loss_type: siglip
   use_masks: false
   use_hard_negatives: true
+  use_keywords: true
   w_global: 1.0
   w_dense: 1.0
+  w_dense_cap: 1.0
   w_region: 1.0
-  w_keyword: 0.1
+  w_counter: 1.0
+  counter_margin: 0.5
+  counter_tau: 0.1
+  w_threshold: 1.0
+  threshold_pos: 0.8
+  threshold_neg: 0.7
+  w_uniform: 0.3
+  w_silhouette: 0.1
   region_min_coverage: 0.1
-  keyword_margin: null
   tokenizer_name: Qwen/Qwen3-Embedding-0.6B
 data:
   data_dir: /data/susanket/vlm/images3
   image_col: image_bytes
-  batch_size: 64
-  num_workers: 8
+  batch_size: 256
+  num_workers: 30
   val_fraction: 0.1
   split_seed: 0
   dense_max_sentences: 8
   hard_neg_per_image: 3
   hard_neg_mut_count: 1
   hard_neg_hardness: 0.5
-  keywords_per_image: 3
-  keyword_template: there is no {}
+  keyword_subsets: 4
+  keyword_negs: 4
+  keyword_hard_negs: 3
+  keyword_hard_neg_swap: 1
   mask_subdir: masks
   max_regions_per_image: 8
   region_template: '{}'

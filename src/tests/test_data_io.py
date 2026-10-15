@@ -119,7 +119,7 @@ def test_index_and_samples():
         assert len(s["dense"]) == 4 and s["summary"] == "a summary"
         assert 1 <= len(s["hard_negs"]) <= 3
         assert all(h not in s["dense"] for h in s["hard_negs"])
-        assert len(s["neg_keywords"]) == 3 and set(s["neg_keywords"]) <= {"red building", "road", "solar panel"}
+        assert set(s["keywords"]) == {"red building", "road", "solar panel"}
         assert s["region_cov"].shape == (len(s["region_kws"]), 7, 7) and set(s["region_kws"]) == {"road", "red building"}
         k = s["region_kws"].index("road")
         assert s["region_cov"][k][:, :3].mean() > 0.9 and s["region_cov"][k][:, 5:].mean() < 0.1  # road is on the left
@@ -133,14 +133,14 @@ def test_index_and_samples():
         vb = SampleBuilder(idx, SampleConfig(train=False, use_masks=True))
         a, c = vb.build(2), vb.build(2)
         assert np.array_equal(a["image"], c["image"]) and a["hard_negs"] == c["hard_negs"] \
-            and a["neg_keywords"] == c["neg_keywords"]
-        # train is stochastic
-        outs = {tuple(b.build(1)["neg_keywords"]) + tuple(b.build(1)["hard_negs"]) for _ in range(20)}
+            and a["keywords"] == c["keywords"]
+        # train is stochastic (hard negatives are sampled / re-mutated every call)
+        outs = {tuple(b.build(1)["hard_negs"]) for _ in range(20)}
         assert len(outs) > 1
 
         # toggles really switch work off
         off = SampleBuilder(idx, SampleConfig(train=False, use_dense=False, use_keywords=False, use_masks=False)).build(0)
-        assert off["dense"] == [] and off["hard_negs"] == [] and off["neg_keywords"] == [] and off["region_kws"] == []
+        assert off["dense"] == [] and off["hard_negs"] == [] and off["keywords"] == [] and off["region_kws"] == []
 
 
 def test_precomputed_embeddings():
