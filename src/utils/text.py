@@ -7,6 +7,9 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 _QUOTED = re.compile(r"'(.*?)'")
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
+# same splitter (and same capture-group style) as preprocess/precompute_eos.py /
+# preprocess/generate_cf.py, so sentence j maps to row j + 1 of the precomputed .npy files
+_SENT_SPLIT_KEEP = re.compile(r"((?<=[.!?])\s+)")
 
 
 def parse_key_elements(value) -> List[str]:
@@ -44,6 +47,18 @@ def split_sentences(text: str, min_chars: int = 3) -> List[str]:
     if not isinstance(text, str) or not text.strip():
         return []
     return [p.strip() for p in _SENT_SPLIT.split(text.strip()) if len(p.strip()) >= min_chars]
+
+
+def split_sentences_exact(text: str) -> List[str]:
+    """The splitter used by preprocess/precompute_eos.py and preprocess/generate_cf.py.
+
+    ``dense_caption`` / ``cf_dense_caption`` .npy files store row 0 = the whole paragraph and
+    rows 1..S = the sentences of THIS list, so precomputed sentence rows can only be mapped
+    back to text with the exact same splitter (no ``min_chars`` filtering, separators dropped).
+    """
+    if not isinstance(text, str) or not text.strip():
+        return []
+    return [s.strip() for s in _SENT_SPLIT_KEEP.split(text.strip())[0::2] if s.strip()]
 
 
 def build_unique(groups: Sequence[Iterable[str]]) -> Tuple[List[str], List[List[int]]]:

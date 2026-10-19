@@ -87,6 +87,7 @@ def datamodule_kwargs(cfg: dict, args) -> dict:
         context_length=m.get("context_length", 256),
         tokenizer_name=m.get("tokenizer_name", "Qwen/Qwen3-Embedding-0.6B"),
         precomputed_image=m.get("precomputed_image", False),
+        precomputed_text=m.get("precomputed_text", False),
         use_masks=args.use_masks if args.use_masks is not None else m.get("use_masks", False),
         use_dense=m.get("w_dense", 1.0) > 0,
         use_keywords=m.get("use_keywords", True),
@@ -122,6 +123,9 @@ def show_raw_sample(dataset, k: int, show_image: bool) -> None:
 
     hr(f"[raw sample {k}] {rec.file_name}  (shard {index.shards[rec.shard].name}, row {rec.row})")
     print(f"  summary      : {s['summary']!r}")
+    if "summary_emb" in s:
+        e = s["summary_emb"]
+        print(f"  summary_emb  : {tuple(e.shape)} {fmt_tensor(e)}  (precomputed Qwen EOS state)")
 
     if "image_emb" in s:
         e = s["image_emb"]
@@ -137,13 +141,23 @@ def show_raw_sample(dataset, k: int, show_image: bool) -> None:
         except Exception as exc:  # pragma: no cover - preview is best-effort
             print(f"  (image preview unavailable: {exc})")
 
-    print(f"  positives    : {len(s['dense'])} dense sentence(s)")
+    dense_rows = s.get("dense_emb")
+    n_dense = len(dense_rows) if dense_rows is not None else len(s["dense"])
+    if dense_rows is not None and "cap_emb" in s:
+        print(f"  cap_emb      : {tuple(s['cap_emb'].shape)} {fmt_tensor(s['cap_emb'])}  (whole paragraph)")
+    print(f"  positives    : {n_dense} dense sentence(s)")
     for j, sent in enumerate(s["dense"]):
         print(f"      + [{j}] {sent}")
+    if dense_rows is not None and not s["dense"] and n_dense:
+        print(f"      (sentence texts unavailable; {n_dense} precomputed embedding rows)")
+    neg_rows = s.get("hard_neg_emb")
     if s["hard_negs"]:
         print(f"  hard negs    : {len(s['hard_negs'])}")
         for j, neg in enumerate(s["hard_negs"]):
             print(f"      - [{j}] {neg}")
+    elif neg_rows is not None and len(neg_rows):
+        print(f"  hard negs    : {len(neg_rows)} counterfactual embedding(s) "
+              f"{tuple(neg_rows.shape)} (cf_dense_caption rows; text not loaded)")
 
     if s["keywords"]:
         print(f"  keywords     : {s['keywords']}")
@@ -175,6 +189,9 @@ def show_batch(collator, samples) -> None:
         print("\n  global summaries")
         for j, txt in enumerate(decode_group(collator, batch["global_tokens"])):
             print(f"    [{j}] {txt}")
+    elif "global_emb" in batch:
+        print(f"\n  global summaries: {tuple(batch['global_emb'].shape)} precomputed embeddings "
+              f"(not tokenised)")
 
     if "dense_tokens" in batch:
         texts = decode_group(collator, batch["dense_tokens"])
@@ -184,6 +201,21 @@ def show_batch(collator, samples) -> None:
             owners = [i for i in range(B) if bool(pos[i, u])]
             tag = f"pos for {owners}" if owners else "hard negative (no positive image)"
             print(f"    [{u}] {tag:38s} {txt}")
+    elif "dense_emb" in batch:
+        emb, pos, neg = batch["dense_emb"], batch["dense_pos"], batch["dense_neg"]
+        print(f"\n  dense sentences ({emb.shape[0]} unique embedding columns, {tuple(emb.shape)}; "
+              f"positives per image from dense_pos, cf negatives from dense_neg)")
+        for u in range(emb.shape[0]):
+            owners = [i for i in range(B) if bool(pos[i, u])]
+            negs = [i for i in range(B) if bool(neg[i, u])]
+            tag = []
+            if owners:
+                tag.append(f"+ {owners}")
+            if negs:
+                tag.append(f"- {negs}")
+            if not tag:
+                tag.append("(unused)")
+            print(f"    [{u}] {'  '.join(tag)}")
 
     if "kw_tokens" in batch:
         texts = decode_group(collator, batch["kw_tokens"])
@@ -236,7 +268,8 @@ def main() -> None:
 
     hr(f"config {args.config}")
     for key in ("data_dir", "image_resolution", "patch_size", "context_length", "precomputed_image",
-                "use_masks", "use_dense", "use_keywords", "use_hard_negatives", "batch_size"):
+                "precomputed_text", "use_masks", "use_dense", "use_keywords", "use_hard_negatives",
+                "batch_size"):
         print(f"  {key:20s} {kw[key]}")
 
     print("\nbuilding index / tokenizer ... (this scans the caption shards)")

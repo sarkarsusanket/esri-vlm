@@ -1,10 +1,10 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = "1"
+os.environ['CUDA_VISIBLE_DEVICES'] = "1,2"
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # tokenizing happens inside dataloader workers
 
 import hashlib
 import random
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -49,13 +49,22 @@ class ClipCollator:
     Batch layout (B images)::
 
         images          (B, 3, H, W)                   raw pixels; only when image embeddings are NOT precomputed
-        image_emb       (B, 1 + P, D)                  precomputed DINOv2 [CLS + patch] tokens; preferred
-                                                        over `images` when present (only one of the two is set)
-        global_tokens   (B, L)                         summary caption of every image
-        cap_tokens      (B, L)                         the whole dense caption of every image
-        dense_tokens    (Ud, L)                        UNIQUE dense sentences of the batch, followed by
+        image_emb       (B, 1 + P, D) or (B, D)        precomputed DINOv2 [CLS + patch] tokens, or CLS only
+                                                        when masks are off (cls_only); preferred over
+                                                        `images` when present (only one of the two is set)
+        global_tokens   (B, L)                         summary caption; when text embeddings are NOT precomputed
+        global_emb      (B, H)                         precomputed summary embedding (precompute_eos.py) instead
+        cap_tokens      (B, L)                         whole dense caption (tokenised mode)
+        cap_emb         (B, H)                         precomputed whole-paragraph embedding (summary stands in
+                                                        for images without a dense caption)
+        cf_cap_emb      (B, H)                         precomputed whole counterfactual paragraph (row 0 of
+        cf_cap_valid    (B,) bool                      cf_dense_caption); cf_cap_valid marks which rows carry
+                                                        a real state (the rest are placeholders, never read)
+        dense_tokens    (Ud, L)                        UNIQUE dense sentences (tokenised mode), followed by
         dense_pos       (B, Ud) bool                   the hard-negative sentences; pos[i, u] = sentence u
         dense_neg       (B, Ud) bool                   is one of image i's sentences
+        dense_emb       (Ud, H)                        the same group as precomputed embeddings: unique sentence
+                                                        states (de-duplicated by content across the batch)
         kw_tokens       (Uk, L)                        UNIQUE keyword texts: positive combinations of the
         kw_pos          (B, Uk) bool                   image's keywords, absent single keywords and
         kw_neg          (B, Uk) bool                   swapped-keyword hard negatives
@@ -63,8 +72,11 @@ class ClipCollator:
         region_cov      (B, K, g, g) float             per-region fraction of every patch cell covered
         region_txt      (B, K) long                    index into region_tokens, -1 = padding
 
-    Dense: positives are de-duplicated so a sentence shared by several images is a positive for
-    all of them (never a false negative); hard negatives are columns owned only by the images that
+    The summary / dense / counterfactual groups come precomputed (`*_emb`, float32 hidden states
+    that the model projects) whenever the samples carry them; keyword and region groups are always
+    tokenised on the fly. Dense: positives are de-duplicated (embedding content, so a sentence
+    shared by several images is a positive for all of them - never a false negative); hard
+    negatives are the precomputed counterfactual sentences, columns owned only by the images that
     produced them. Keywords: positives are combinations of the image's own keywords (marked by
     content, so a combination that is true for another image is a positive there too); negatives
     are absent keywords and swapped-keyword hard negatives owned by the image. A group is left out
@@ -148,18 +160,89 @@ class ClipCollator:
                     neg[i, u] = True
         return uniq, pos, neg
 
+    @staticmethod
+    def _emb_rows(sample: Dict[str, Any], key: str) -> np.ndarray:
+        v = sample.get(key)
+        return v if v is not None and len(v) else np.zeros((0, 0), np.float32)
+
+    def _dense_emb_group(self, out: Dict[str, torch.Tensor], samples: List[Dict[str, Any]]) -> None:
+        """Whole-caption + unique sentence embeddings with content positives / owned cf negatives.
+
+        Columns are de-duplicated by embedding content (identical sentences share identical
+        precomputed states), so a sentence shared by several images is a positive for all of them;
+        a counterfactual column is owned only by the image that produced it, and one that collides
+        with a real positive is dropped (it would be a false negative).
+        """
+        B = len(samples)
+        if not any(len(self._emb_rows(s, "dense_emb")) for s in samples):
+            return
+        # the paragraph state stands in for samples without one (mirrors `dense_text or summary`)
+        out["cap_emb"] = torch.from_numpy(np.stack([s.get("cap_emb", s["summary_emb"]) for s in samples]))
+
+        # whole-paragraph counterfactual states: the paragraph-level negative for the cf-cap loss.
+        # A missing state keeps a placeholder row (never read) flagged off by `cf_cap_valid`.
+        cf_caps = [s.get("cf_cap_emb") for s in samples]
+        if any(c is not None for c in cf_caps):
+            ref = next(c for c in cf_caps if c is not None)
+            out["cf_cap_emb"] = torch.from_numpy(np.stack([c if c is not None else ref for c in cf_caps]))
+            out["cf_cap_valid"] = torch.tensor([c is not None for c in cf_caps], dtype=torch.bool)
+
+        rows: List[np.ndarray] = []
+        col_of: Dict[bytes, int] = {}
+
+        def _add(key: bytes, row: np.ndarray) -> int:
+            j = col_of.get(key)
+            if j is None:
+                j = col_of[key] = len(rows)
+                rows.append(row)
+            return j
+
+        pos_keys: Set[bytes] = set()
+        pos_pairs: List[Tuple[int, int]] = []
+        for i, s in enumerate(samples):
+            for row in self._emb_rows(s, "dense_emb"):
+                r = np.ascontiguousarray(row, dtype=np.float32)
+                k = r.tobytes()
+                pos_keys.add(k)
+                pos_pairs.append((i, _add(k, r)))
+
+        neg_pairs: List[Tuple[int, int]] = []
+        for i, s in enumerate(samples):
+            for row in self._emb_rows(s, "hard_neg_emb"):
+                r = np.ascontiguousarray(row, dtype=np.float32)
+                k = r.tobytes()
+                if k in pos_keys:
+                    continue  # a cf twin identical to a real sentence is a positive, not a negative
+                neg_pairs.append((i, _add(k, r)))
+
+        if not rows:
+            return
+        out["dense_emb"] = torch.from_numpy(np.stack(rows))
+        pos = torch.zeros(B, len(rows), dtype=torch.bool)
+        neg = torch.zeros(B, len(rows), dtype=torch.bool)
+        for i, j in pos_pairs:
+            pos[i, j] = True
+        for i, j in neg_pairs:
+            neg[i, j] = True
+        out["dense_pos"] = pos
+        out["dense_neg"] = neg
+
     def __call__(self, samples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         B = len(samples)
-        out: Dict[str, torch.Tensor] = {
-            "global_tokens": self.tokenize([s["summary"] for s in samples]),
-        }
+        out: Dict[str, torch.Tensor] = {}
+        if "summary_emb" in samples[0]:  # precomputed Qwen states (precompute_eos.py)
+            out["global_emb"] = torch.from_numpy(np.stack([s["summary_emb"] for s in samples]))
+        else:
+            out["global_tokens"] = self.tokenize([s["summary"] for s in samples])
         if "image_emb" in samples[0]:
             out["image_emb"] = torch.stack([s["image_emb"] for s in samples])
         else:
             out["images"] = torch.stack([s["image"] for s in samples])
 
         # ---- dense: whole caption + individual sentences with owned hard negatives
-        if any(s["dense"] for s in samples):
+        if "summary_emb" in samples[0]:
+            self._dense_emb_group(out, samples)
+        elif any(s["dense"] for s in samples):
             out["cap_tokens"] = self.tokenize([s.get("dense_text") or s["summary"] for s in samples])
             uniq, idx = build_unique([s["dense"] for s in samples])
             positives = set(uniq)
@@ -229,6 +312,7 @@ class CLIPDataModule(pl.LightningDataModule):
         context_length: int = 256,
         tokenizer_name: str = "Qwen/Qwen3-Embedding-0.6B",
         precomputed_image: bool = False,
+        precomputed_text: bool = False,
         use_masks: bool = False,
         use_dense: bool = True,
         use_keywords: bool = True,
@@ -263,7 +347,10 @@ class CLIPDataModule(pl.LightningDataModule):
         h = self.hparams
         self.index = ShardIndex(h.data_dir, image_col=h.image_col, use_masks=h.use_masks,
                                 mask_subdir=h.mask_subdir, row_group_cache=h.row_group_cache,
-                                precomputed=h.precomputed_image)
+                                precomputed=h.precomputed_image,
+                                # only the CLS token is used unless the region loss needs patches
+                                cls_only=h.precomputed_image and not h.use_masks,
+                                precomputed_text=h.precomputed_text)
 
         perm = np.random.RandomState(h.split_seed).permutation(len(self.index))
         n_val = int(len(perm) * h.val_fraction)

@@ -7,8 +7,9 @@ import pandas as pd
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from shards import SampleBuilder, SampleConfig, ShardIndex  # noqa: E402
+from shards import SampleBuilder, SampleConfig, ShardIndex, SkipSample  # noqa: E402
 from utils.crops import masks_to_grid, center_square_box, sample_resized_crop_box  # noqa: E402
+from utils.text import split_sentences_exact  # noqa: E402
 
 
 def png(w, h, color):
@@ -20,8 +21,12 @@ def png(w, h, color):
 DENSE = ("A red roof house has a swimming pool to the north. Several cars are parked along the road. "
          "The field is green. Dense forest covers the east side.")
 
+# hidden dim of the fake precomputed Qwen EOS embeddings written by make_repo(with_text_emb=True)
+TEXT_H = 4
 
-def make_repo(root: Path, with_emb: bool = False, skip_emb=()):
+
+def make_repo(root: Path, with_emb: bool = False, skip_emb=(), with_text_emb: bool = False,
+              skip_text=()):
     (root / "masks").mkdir(parents=True)
     for sh, n in (("00", 10), ("01", 7)):
         names = [f"{sh}_{i}.jpg" for i in range(n)]
@@ -35,6 +40,21 @@ def make_repo(root: Path, with_emb: bool = False, skip_emb=()):
                     continue
                 rng = np.random.default_rng(abs(hash(fn)) % 2 ** 32)
                 np.save(emb_dir / f"{Path(fn).stem}.npy", rng.standard_normal((50, 8)).astype(np.float32))
+        if with_text_emb:  # precompute_eos.py layout: summary (1, H), dense/cf (1 + S, H) fp16
+            n_rows = 1 + len(split_sentences_exact(DENSE))
+            for col in ("summary", "dense_caption", "cf_dense_caption"):
+                (root / f"caption-{sh}" / col).mkdir(parents=True, exist_ok=True)
+            for i, fn in enumerate(names):
+                if fn in skip_text:
+                    continue
+                rng = np.random.default_rng(abs(hash("txt" + fn)) % 2 ** 32)
+                stem = Path(fn).stem
+                dense = rng.standard_normal((n_rows, TEXT_H))
+                np.save(root / f"caption-{sh}" / "summary" / f"{stem}.npy",
+                        rng.standard_normal((1, TEXT_H)).astype(np.float16))
+                np.save(root / f"caption-{sh}" / "dense_caption" / f"{stem}.npy", dense.astype(np.float16))
+                np.save(root / f"caption-{sh}" / "cf_dense_caption" / f"{stem}.npy",
+                        (dense + 100.0).astype(np.float16))
         # caption parquet in a different row order, one extra file without image, one empty summary
         cap_names = names[::-1] + ["ghost.jpg"]
         pd.DataFrame({"file_name": cap_names,
@@ -171,6 +191,81 @@ def test_precomputed_embeddings():
             b.build(i0)
             assert False, "expected ValueError for a wrong precomputed embedding shape"
         except ValueError:
+            pass
+
+
+def test_precomputed_text_samples():
+    """Summary / dense / counterfactual .npy embeddings replace strings + on-the-fly mutation."""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        make_repo(root, with_emb=True, with_text_emb=True, skip_text={"01_2.jpg"})
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            idx = ShardIndex(str(root), precomputed=True, precomputed_text=True,
+                             row_group_cache=2, verbose=False)
+        # 01_2 has no summary .npy -> dropped on top of the usual empty-summary / ghost drops
+        assert len(idx) == (10 - 1) + (7 - 1) - 1, len(idx)
+        assert "01_2.jpg" not in {r.file_name for r in idx.records}
+
+        b = SampleBuilder(idx, SampleConfig(train=False))
+        s = b.build(0)
+        assert s["summary_emb"].shape == (TEXT_H,) and s["summary_emb"].dtype == np.float32
+        assert s["cap_emb"].shape == (TEXT_H,) and s["cap_emb"].dtype == np.float32
+        assert s["cf_cap_emb"].shape == (TEXT_H,) and s["cf_cap_emb"].dtype == np.float32
+        assert not np.array_equal(s["cf_cap_emb"], s["cap_emb"])  # whole cf paragraph, not the positive
+        assert s["dense_emb"].shape == (4, TEXT_H)  # 4 sentences, dense_max_sentences=8
+        assert s["hard_neg_emb"].shape == (3, TEXT_H)  # hard_neg_per_image=3 counterfactual rows
+        assert len(s["dense"]) == 4  # sentence strings stay row-aligned with dense_emb
+        assert s["keywords"] == ["red building", "road", "solar panel"]
+        # cf rows are dense rows + 100 in the fixture -> they must not collide with positives
+        assert not set(map(bytes, s["dense_emb"])) & set(map(bytes, s["hard_neg_emb"]))
+
+        # fewer positives: dense_max_sentences caps the rows, negatives stay within them
+        b2 = SampleBuilder(idx, SampleConfig(train=False, dense_max_sentences=2))
+        s2 = b2.build(0)
+        assert s2["dense_emb"].shape == (2, TEXT_H) and len(s2["dense"]) == 2
+        assert s2["hard_neg_emb"].shape[0] <= 2
+
+        # toggles switch the groups off (summary stays: it feeds the global loss)
+        off = SampleBuilder(idx, SampleConfig(train=False, use_dense=False)).build(0)
+        assert "dense_emb" not in off and "cap_emb" not in off
+        assert off["summary_emb"].shape == (TEXT_H,)
+        no_neg = SampleBuilder(idx, SampleConfig(train=False, use_hard_negatives=False)).build(0)
+        assert no_neg["dense_emb"].shape == (4, TEXT_H) and len(no_neg["hard_neg_emb"]) == 0
+
+        # validation is deterministic, training re-samples the negative rows
+        assert np.array_equal(b.build(3)["dense_emb"], b.build(3)["dense_emb"])
+        outs = {bytes(SampleBuilder(idx, SampleConfig(train=True)).build(1)["hard_neg_emb"])
+                for _ in range(20)}
+        assert len(outs) > 1
+
+        # records whose cf embedding is not precomputed yet: positives but no negatives
+        cf_path = root / "caption-00" / "cf_dense_caption" / "00_1.npy"
+        cf_path.unlink()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            idx2 = ShardIndex(str(root), precomputed=True, precomputed_text=True, verbose=False)
+        i1 = next(i for i, r in enumerate(idx2.records) if r.file_name == "00_1.jpg")
+        s1 = SampleBuilder(idx2, SampleConfig(train=False)).build(i1)
+        assert s1["dense_emb"].shape == (4, TEXT_H) and len(s1["hard_neg_emb"]) == 0
+        assert "cf_cap_emb" not in s1  # no cf paragraph -> no paragraph-level negative either
+
+        # a cf file with a drifted sentence count is ignored instead of misaligned
+        np.save(cf_path, np.zeros((2, TEXT_H), np.float16))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            idx3 = ShardIndex(str(root), precomputed=True, precomputed_text=True, verbose=False)
+        i1 = next(i for i, r in enumerate(idx3.records) if r.file_name == "00_1.jpg")
+        assert len(SampleBuilder(idx3, SampleConfig(train=False)).build(i1)["hard_neg_emb"]) == 0
+
+        # a corrupt (non-finite) text embedding skips the record instead of poisoning the run
+        # (00_0.jpg is the dropped empty-summary row; 00_3 is a live record)
+        np.save(root / "caption-00" / "summary" / "00_3.npy", np.full((1, TEXT_H), np.nan, np.float16))
+        i0 = next(i for i, r in enumerate(idx.records) if r.file_name == "00_3.jpg")
+        try:
+            b.build(i0)
+            assert False, "expected SkipSample for a non-finite summary embedding"
+        except SkipSample:
             pass
 
 

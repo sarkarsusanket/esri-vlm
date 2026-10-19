@@ -7,6 +7,9 @@ model:
   freeze_image_tower: true              # false -> fine-tune the DINOv2 backbone too
   precomputed_image: true               # true -> feed precomputed DINOv2 .npy embs (image-xx/ dirs);
                                         # no DINOv2 backbone is loaded, no image bytes are decoded
+  precomputed_text: true                # true -> feed precomputed Qwen EOS .npy embs (caption-xx/{summary,
+                                        # dense_caption,cf_dense_caption}/); no caption is tokenised or
+                                        # negated on the fly, keyword/region texts still are
   # ---- projected embedding space
   embed_dim: 256
   image_resolution: 224        # also forwarded to the datamodule
@@ -20,11 +23,14 @@ model:
   # ---- losses
   loss_type: siglip              # clip | siglip   (siglip: scale=log 10, learnable bias=-10)
   use_masks: false             # true -> load masks + region-level loss; false -> nothing mask-related runs
-  use_hard_negatives: true     # mutated dense sentences as extra negatives (needs w_dense > 0)
-  use_keywords: true           # positive keyword combinations + absent/swapped-keyword negatives
+  use_hard_negatives: true     # dense hard negatives: precomputed cf sentences when precomputed_text,
+                               # rule-based mutations otherwise (needs w_dense > 0)
+  use_keywords: false           # positive keyword combinations + absent/swapped-keyword negatives
   w_global: 1.0                # summary caption  <-> image CLS
   w_dense: 1.0                 # each dense sentence <-> its image (+ hard negatives); 0 disables
   w_dense_cap: 1.0             # whole dense caption <-> image (GCL); 0 disables
+  w_dense_cap_cf: 1.0          # whole dense paragraph (pos) vs. whole counterfactual paragraph (neg)
+                               # <-> image; needs precomputed cf states (precomputed_text); 0 disables
   w_region: 1.0                # masked patches <-> keyword text; only used if use_masks
   # counterfactual margin loss (dense sentences + keywords)
   w_counter: 1.0
@@ -38,23 +44,26 @@ model:
   w_uniform: 0.3
   w_silhouette: 0.1
   region_min_coverage: 0.1     # a patch counts for a region if >= 10% of it is inside the mask
+  text_cache_size: 50000       # LRU cache of frozen Qwen pooled states for repeated texts
+                               # (keyword groups are re-encoded every step); 0 disables
 
 data:
   data_dir: "/data/susanket/vlm/images3"   # image-xx.parquet, image-xx/<stem>.npy (DINOv2 embs), caption-xx.parquet, masks/
   image_col: "image_bytes"   # only read when precomputed_image is false
-  batch_size: 256
-  num_workers: 30
+  batch_size: 1024
+  num_workers: 50
   val_fraction: 0.1
   split_seed: 0
   # dense captions / hard negatives
-  dense_max_sentences: 8
-  hard_neg_per_image: 3        # sentences per image that get a mutated twin
-  hard_neg_mut_count: 1        # edits per mutated sentence
-  hard_neg_hardness: 0.5
+  dense_max_sentences: 5
+  hard_neg_per_image: 2        # sentences per image that get a negative twin (the cf_dense_caption
+                               # row when precomputed_text, a mutated sentence otherwise)
+  hard_neg_mut_count: 1        # edits per mutated sentence (only when text embs are not precomputed)
+  hard_neg_hardness: 0.5       # mutation hardness (only when text embs are not precomputed)
   # keyword groups
-  keyword_subsets: 4           # positive combos sampled per image
-  keyword_negs: 4              # absent single keywords used as negatives per image
-  keyword_hard_negs: 3         # swapped-keyword hard negatives per image
+  keyword_subsets: 2           # positive combos sampled per image
+  keyword_negs: 2              # absent single keywords used as negatives per image
+  keyword_hard_negs: 1         # swapped-keyword hard negatives per image
   keyword_hard_neg_swap: 1     # keywords replaced when building a hard negative
   # regions
   mask_subdir: "masks"
@@ -66,5 +75,8 @@ data:
   row_group_cache: 4
 
 trainer:
+  accelerator: auto             # auto -> all visible CUDA devices (do NOT pin CUDA_VISIBLE_DEVICES here)
+  devices: auto                 # auto -> every GPU Lightning can see, DDP across them
   max_epochs: 100
-  accumulate_grad_batches: 4
+  precision:  bf16-mixed
+  accumulate_grad_batches: 1

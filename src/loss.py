@@ -1,3 +1,6 @@
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = "1,2"
+
 from typing import Optional
 
 import torch
@@ -232,7 +235,7 @@ class CounterfactualMarginLoss(nn.Module):
             s_pos = sim_im[i, p]                 # (P,)
             s_neg = sim_im[i, n]                 # (N,)
             cross = sim_tt[p][:, n]              # (P, N) cosine between each a+ and a-
-            margin = self.margin * (1.0 - cross / self.tau_sim)
+            margin = self.margin * (1.0 - cross)    # 16-10 I am removing the tau_sim as it causes inconsistency
             terms.append(F.softplus((s_neg.unsqueeze(0) - s_pos.unsqueeze(1) + margin) / self.tau))
         if not terms:
             return _zero(img_emb)

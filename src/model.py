@@ -1,8 +1,8 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = "1"
+os.environ['CUDA_VISIBLE_DEVICES'] = "1,2"
 
 from collections import OrderedDict
-from typing import Tuple, Union, Optional
+from typing import Dict, Tuple, Union, Optional
 
 import numpy as np
 import torch
@@ -505,7 +505,7 @@ def pool_tokens(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor,
 class DINOv2ImageTower(nn.Module):
     """DINOv2 ViT backbone (frozen by default) + a trainable linear projection.
 
-    ``forward`` returns the projected CLS token; with ``return_patches=True`` it also
+    ``forward`` returns the projected CLS token (precomputed input may also be CLS-only (B, D)); with ``return_patches=True`` it also
     returns the projected patch tokens (both in the shared embedding space).
 
     With ``precomputed=True`` the backbone is not loaded at all: ``forward`` instead expects
@@ -560,6 +560,13 @@ class DINOv2ImageTower(nn.Module):
         dtype = self.proj.weight.dtype
 
         if self.precomputed:
+            if x.ndim == 2:  # CLS-only features (B, D) from cls_only data loading
+                if return_patches:
+                    raise ValueError("return_patches=True needs full (B, 1 + P, D) features; "
+                                     "got CLS-only (B, D). Use cls_only=False when use_masks=True")
+                if x.shape[-1] != self.hidden_dim:
+                    raise ValueError(f"CLS features must have shape (B, {self.hidden_dim}), got {tuple(x.shape)}")
+                return self.proj(x.to(dtype))
             if x.ndim != 3 or x.shape[-1] != self.hidden_dim:
                 raise ValueError(
                     f"precomputed DINOv2 features must have shape (B, 1 + P, {self.hidden_dim}), "
@@ -584,11 +591,15 @@ class DINOv2ImageTower(nn.Module):
 
 
 class QwenTextTower(nn.Module):
-    """Qwen3-Embedding backbone (frozen by default) + a trainable linear projection."""
+    """Qwen3-Embedding backbone (frozen by default) + a trainable linear projection.
+
+    ``forward`` tokenises-free encodes a batch of texts; ``forward_emb`` instead projects the
+    precomputed pooled (EOS) hidden states from ``preprocess/precompute_eos.py``.
+    """
 
     def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B", embed_dim: int = 512,
                  context_length: int = 256, pooling: str = "last_eos", freeze: bool = True,
-                 pad_token_id: Optional[int] = None):
+                 pad_token_id: Optional[int] = None, cache_size: int = 50000):
         super().__init__()
         self.backbone = AutoModel.from_pretrained(model_name)
         self.freeze = freeze
@@ -596,6 +607,11 @@ class QwenTextTower(nn.Module):
         self.context_length = context_length
         self.pooling = pooling
         self.pad_token_id = pad_token_id
+        # LRU cache of pooled EOS states for repeated texts (keyword groups are re-encoded every
+        # step but come from a bounded vocabulary). Only the FROZEN backbone output is cached, so
+        # the trainable projection is re-applied each step and never goes stale.
+        self.cache_size = int(cache_size)
+        self._pooled_cache: "OrderedDict[tuple, torch.Tensor]" = OrderedDict()
 
         self.proj = nn.Linear(self.hidden_dim, embed_dim, bias=False)
         nn.init.normal_(self.proj.weight, std=0.02)
@@ -611,6 +627,41 @@ class QwenTextTower(nn.Module):
             self.backbone.eval()
         return self
 
+    def _key(self, ids: list) -> tuple:
+        # drop padding so the same text hits the cache regardless of how it was padded in a batch
+        if self.pad_token_id is None:
+            return tuple(ids)
+        return tuple(t for t in ids if t != self.pad_token_id)
+
+    def _pooled(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Pooled EOS states for the batch, backed by an LRU cache when the backbone is frozen."""
+        if self.cache_size <= 0 or not self.freeze:
+            hidden = self.backbone(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+            if self.freeze:
+                hidden = hidden.detach()
+            return pool_tokens(hidden, attention_mask, self.pooling)
+
+        keys = [self._key(ids) for ids in input_ids.tolist()]
+        cache = self._pooled_cache
+        miss = [r for r, k in enumerate(keys) if k not in cache]
+        new_vals: Dict[tuple, torch.Tensor] = {}
+        if miss:
+            sub_ids, sub_mask = input_ids[miss], attention_mask[miss]
+            hidden = self.backbone(input_ids=sub_ids, attention_mask=sub_mask).last_hidden_state
+            pooled = pool_tokens(hidden.detach(), sub_mask, self.pooling).detach()
+            new_vals = {keys[r]: pooled[j].clone() for j, r in enumerate(miss)}
+        # assemble from a local map first: eviction below must never remove a key this batch needs
+        out = [cache[k] if k in cache else new_vals[k] for k in keys]
+        for k, v in new_vals.items():
+            cache[k] = v
+            cache.move_to_end(k)
+        for k in keys:  # refresh recency of hits so they are not evicted prematurely
+            if k in cache:
+                cache.move_to_end(k)
+        while len(cache) > self.cache_size:
+            cache.popitem(last=False)
+        return torch.stack(out, 0)
+
     def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
         if attention_mask is None:
             if self.pad_token_id is None:
@@ -618,10 +669,20 @@ class QwenTextTower(nn.Module):
             else:
                 attention_mask = (input_ids != self.pad_token_id).long()
 
-        hidden = self.backbone(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        if self.freeze:
-            hidden = hidden.detach()
-        pooled = pool_tokens(hidden, attention_mask, self.pooling)
+        pooled = self._pooled(input_ids, attention_mask)
+        return self.proj(pooled.to(self.proj.weight.dtype))
+
+    def forward_emb(self, pooled: torch.Tensor) -> torch.Tensor:
+        """Project a precomputed pooled (EOS) hidden state, skipping the backbone.
+
+        Used for the summary / dense-caption / counterfactual embeddings written by
+        ``preprocess/precompute_eos.py`` (raw last-layer EOS states, (N, hidden_dim)); only the
+        trainable linear projection runs. Keyword texts are still tokenised and go through
+        ``forward``, so the Qwen backbone must stay loaded (and frozen) in this mode.
+        """
+        if pooled.ndim != 2 or pooled.shape[-1] != self.hidden_dim:
+            raise ValueError(f"precomputed text embeddings must have shape (N, {self.hidden_dim}), "
+                             f"got {tuple(pooled.shape)}")
         return self.proj(pooled.to(self.proj.weight.dtype))
 
 
@@ -630,6 +691,12 @@ class CLIP(nn.Module):
 
     The image tower is DINOv2, the text tower is Qwen3-Embedding; each backbone output is
     linearly projected into `embed_dim`. Backbones are frozen by default.
+
+    With ``precomputed_image`` / ``precomputed_text`` the matching backbone is replaced by its
+    precomputed outputs (DINOv2 tokens from ``generate_dino_emb.py`` / ``precompute_cls.py``,
+    Qwen EOS states from ``precompute_eos.py``) and only the projections run. The text backbone
+    itself is still loaded in ``precomputed_text`` mode because keyword / region groups remain
+    tokenised and encoded on the fly.
     """
 
     def __init__(
@@ -643,13 +710,20 @@ class CLIP(nn.Module):
         freeze_text_tower: bool = True,
         freeze_image_tower: bool = True,
         precomputed_image: bool = False,
+        precomputed_text: bool = False,
         pad_token_id: Optional[int] = None,
+        text_cache_size: int = 50000,
         # logit scale / bias (SigLIP uses scale=log(10) and a learnable bias=-10)
         logit_scale_init: float = float(np.log(1 / 0.07)),
         use_logit_bias: bool = False,
         logit_bias_init: float = -10.0,
     ):
         super().__init__()
+
+        if precomputed_text and not freeze_text_tower:
+            raise ValueError("precomputed_text=True requires freeze_text_tower=True "
+                             "(precomputed embeddings cannot be fine-tuned)")
+        self.precomputed_text = precomputed_text
 
         self.visual = DINOv2ImageTower(
             model_name=image_model_name,
@@ -665,6 +739,7 @@ class CLIP(nn.Module):
             pooling=text_pooling,
             freeze=freeze_text_tower,
             pad_token_id=pad_token_id,
+            cache_size=text_cache_size,
         )
 
         self.logit_scale = nn.Parameter(torch.ones([]) * logit_scale_init)
@@ -684,6 +759,10 @@ class CLIP(nn.Module):
         if isinstance(tokens, dict):
             return self.transformer(tokens["input_ids"], tokens["attention_mask"])
         return self.transformer(tokens)
+
+    def encode_text_emb(self, emb: torch.Tensor) -> torch.Tensor:
+        """Projected text features for precomputed pooled (EOS) hidden states, (N, hidden_dim) -> (N, embed_dim)."""
+        return self.transformer.forward_emb(emb)
 
     def forward(self, image, text):
         image_features = self.encode_image(image)

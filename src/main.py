@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = "1"
+os.environ['CUDA_VISIBLE_DEVICES'] = "1,2"
 
 import csv
 import math
@@ -38,6 +38,8 @@ class CLIPLightningModule(pl.LightningModule):
         freeze_text_tower: bool = True,
         freeze_image_tower: bool = True,
         precomputed_image: bool = False,  # True -> datamodule feeds precomputed DINOv2 .npy embs
+        precomputed_text: bool = False,   # True -> datamodule feeds precomputed Qwen EOS .npy embs
+                                          # (summary / dense / counterfactual); keywords stay tokenised
         # model architecture
         embed_dim: int = 512,
         image_resolution: int = 224,
@@ -50,11 +52,14 @@ class CLIPLightningModule(pl.LightningModule):
         # losses
         loss_type: Literal["clip", "siglip"] = "clip",
         use_masks: bool = False,  # True -> load masks and add the region-level loss
-        use_hard_negatives: bool = True,  # mutated dense sentences as extra negatives (data side)
+        use_hard_negatives: bool = True,  # dense hard negatives (precomputed cf sentences when
+                                          # precomputed_text, rule-based mutations otherwise; data side)
         use_keywords: bool = True,  # build positive/negative keyword groups (data side)
         w_global: float = 1.0,  # summary caption <-> image CLS
         w_dense: float = 1.0,  # individual dense sentences <-> image (multi-positive contrastive)
         w_dense_cap: float = 1.0,  # whole dense caption <-> image (GCL)
+        w_dense_cap_cf: float = 1.0,  # whole dense caption (positive) vs. whole counterfactual
+                                      # paragraph (negative) <-> image (needs precomputed cf states)
         w_region: float = 1.0,  # only used when use_masks is True
         # counterfactual margin loss (applied to the dense sentences and the keywords)
         w_counter: float = 1.0,
@@ -70,6 +75,8 @@ class CLIPLightningModule(pl.LightningModule):
         region_min_coverage: float = 0.1,  # a patch belongs to a region if >= this fraction is masked
         # tokenizer
         tokenizer_name: str = "Qwen/Qwen3-Embedding-0.6B",
+        # LRU cache of frozen Qwen pooled states for repeated texts (keyword groups); 0 disables
+        text_cache_size: int = 50000,
     ) -> None:
         super().__init__()
 
@@ -93,7 +100,9 @@ class CLIPLightningModule(pl.LightningModule):
             freeze_text_tower=freeze_text_tower,
             freeze_image_tower=freeze_image_tower,
             precomputed_image=precomputed_image,
+            precomputed_text=precomputed_text,
             pad_token_id=self.tokenizer.pad_token_id,
+            text_cache_size=text_cache_size,
             **logit_kwargs,
         )
         # print(self.model)
@@ -106,7 +115,6 @@ class CLIPLightningModule(pl.LightningModule):
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.warmup_steps = warmup_steps
-        self._last_step = None  # (stage, batch_idx, {component: value}, total) for the CSV callback
 
     def tokenize(self, texts: List[str]) -> Dict[str, torch.Tensor]:
         tokens = self.tokenizer(
@@ -138,7 +146,17 @@ class CLIPLightningModule(pl.LightningModule):
         return F.normalize(emb, dim=-1), visible
 
     def enc_text(self, tokens):
-            return F.normalize(self.model.encode_text(tokens), dim=-1)
+        return F.normalize(self.model.encode_text(tokens), dim=-1)
+
+    def text_group(self, batch, emb_key: str, tok_key: str) -> torch.Tensor:
+        """L2-normalised text embeddings for one loss group.
+
+        Precomputed hidden states (`emb_key`, from preprocess/precompute_eos.py) are projected
+        directly; otherwise the tokenised strings (`tok_key`) run through the Qwen tower.
+        """
+        if emb_key in batch:
+            return F.normalize(self.model.encode_text_emb(batch[emb_key]), dim=-1)
+        return self.enc_text(batch[tok_key])
 
     @staticmethod
     def _positive_points(img: torch.Tensor, groups):
@@ -169,16 +187,35 @@ class CLIPLightningModule(pl.LightningModule):
         pos_groups = []  # (text_emb, pos_mask) fed to the silhouette loss
 
         # 1) GCL: global contrastive loss (summary caption <-> image CLS)
-        if h.w_global > 0 and "global_tokens" in batch:
-            losses["global"] = self.pair_loss(self.model.logits(img, self.enc_text(batch["global_tokens"])), eye)
+        if h.w_global > 0 and ("global_emb" in batch or "global_tokens" in batch):
+            g = self.text_group(batch, "global_emb", "global_tokens")
+            losses["global"] = self.pair_loss(self.model.logits(img, g), eye)
 
         # 2a) whole dense caption <-> image (GCL over the full caption)
-        if h.w_dense_cap > 0 and "cap_tokens" in batch:
-            losses["dense_cap"] = self.pair_loss(self.model.logits(img, self.enc_text(batch["cap_tokens"])), eye)
+        if h.w_dense_cap > 0 and ("cap_emb" in batch or "cap_tokens" in batch):
+            cap = self.text_group(batch, "cap_emb", "cap_tokens")
+            losses["dense_cap"] = self.pair_loss(self.model.logits(img, cap), eye)
+
+        # 2c) whole-paragraph contrastive: the dense paragraph is the positive, the whole
+        # counterfactual paragraph (cf_dense_caption row 0) is a paragraph-level negative, and the
+        # other in-batch paragraphs are negatives too. Rows without a precomputed cf state are
+        # dropped so a missing negative never turns into a false one.
+        if h.w_dense_cap_cf > 0 and "cf_cap_emb" in batch and "cap_emb" in batch:
+            cap = self.text_group(batch, "cap_emb", "cap_tokens")
+            cf = F.normalize(self.model.encode_text_emb(batch["cf_cap_emb"]), dim=-1)
+            valid = batch.get("cf_cap_valid")
+            if valid is None:
+                valid = torch.ones(cf.shape[0], dtype=torch.bool, device=cf.device)
+            if bool(valid.any()):
+                bank = torch.cat([cap, cf[valid]], 0)  # (B + Bv, E); columns 0..B-1 are the positives
+                pos = torch.zeros(B, bank.shape[0], dtype=torch.bool, device=img.device)
+                pos[torch.arange(B, device=img.device), torch.arange(B, device=img.device)] = True
+                losses["dense_cap_cf"] = self.pair_loss(self.model.logits(img, bank), pos)
+                uniform_texts.append(bank)
 
         # 2b) dense sentences: multi-positive contrastive + counterfactual margin + threshold
-        if h.w_dense > 0 and "dense_tokens" in batch:
-            dt = self.enc_text(batch["dense_tokens"])
+        if h.w_dense > 0 and ("dense_emb" in batch or "dense_tokens" in batch):
+            dt = self.text_group(batch, "dense_emb", "dense_tokens")
             losses["dense"] = self.pair_loss(self.model.logits(img, dt), batch["dense_pos"])
             uniform_texts.append(dt)
             pos_groups.append((dt, batch["dense_pos"]))
@@ -221,6 +258,7 @@ class CLIPLightningModule(pl.LightningModule):
 
         weights = {
             "global": h.w_global, "dense_cap": h.w_dense_cap, "dense": h.w_dense,
+            "dense_cap_cf": h.w_dense_cap_cf,
             "dense_counter": h.w_counter, "dense_threshold": h.w_threshold,
             "kw_counter": h.w_counter, "kw_threshold": h.w_threshold,
             "region": h.w_region, "uniform": h.w_uniform, "silhouette": h.w_silhouette,
@@ -244,23 +282,24 @@ class CLIPLightningModule(pl.LightningModule):
         return self.calculate_losses(batch, img, patches, h, B, use_regions)
     
 
+    def _zero_loss(self) -> torch.Tensor:
+        """Graph-connected 0 so a skipped batch still runs backward + DDP all-reduce (avoids hangs)."""
+        p = next((p for p in self.model.parameters() if p.requires_grad), None)
+        return p.sum() * 0.0 if p is not None else torch.zeros((), device=self.device)
+
     def _shared_step(self, batch, batch_idx, stage: str):
         total, losses = self.common_step(batch, batch_idx)
         if torch.is_tensor(total) and not torch.isfinite(total):
             # a bad sample slipped through the data-side checks: skip the batch instead of
-            # backpropagating NaN/Inf and permanently poisoning the weights
+            # backpropagating NaN/Inf and permanently poisoning the weights. Keeping a
+            # graph-connected zero (instead of returning None) makes every DDP rank run the same
+            # backward pass, so one poisoned rank cannot deadlock the others.
             warnings.warn(f"non-finite {stage} loss at batch {batch_idx}; skipping batch")
-            self._last_step = None
-            return None
+            total, losses = self._zero_loss(), {}
         bs = batch["images"].shape[0] if "images" in batch else batch["image_emb"].shape[0]
-        on_step = stage == "train"
-        self.log(f"{stage}_loss", total, prog_bar=True, on_epoch=True, on_step=on_step, batch_size=bs)
+        self.log(f"{stage}_loss", total, prog_bar=True, on_epoch=True, batch_size=bs)
         for name, value in losses.items():
-            self.log(f"{stage}_loss_{name}", value.detach(), on_epoch=True, on_step=on_step, batch_size=bs)
-        # keep the raw per-iteration values for MetricsCSVCallback
-        components = {name: float(value.detach()) for name, value in losses.items()}
-        components["total"] = float(total.detach())
-        self._last_step = (stage, batch_idx, components)
+            self.log(f"{stage}_loss_{name}", value.detach(), on_epoch=True, batch_size=bs)
         return total
 
     def training_step(self, batch, batch_idx):
@@ -310,12 +349,14 @@ class CLIPLightningModule(pl.LightningModule):
 class MyLightningCLI(LightningCLI):
     def add_arguments_to_parser(self, parser):
         parser.add_argument("--watchmodel", action="store_true")
+        parser.add_argument("--ckpt_path", type=str, default=None, help="Path to checkpoint to resume from (e.g. last.ckpt or a specific .ckpt)")
         # one source of truth: these are set under `model:` and forwarded to the datamodule
         parser.link_arguments("model.image_resolution", "data.image_resolution")
         parser.link_arguments("model.vision_patch_size", "data.patch_size")
         parser.link_arguments("model.context_length", "data.context_length")
         parser.link_arguments("model.tokenizer_name", "data.tokenizer_name")
         parser.link_arguments("model.precomputed_image", "data.precomputed_image")
+        parser.link_arguments("model.precomputed_text", "data.precomputed_text")
         parser.link_arguments("model.use_masks", "data.use_masks")
         parser.link_arguments("model.use_hard_negatives", "data.use_hard_negatives")
         # a loss with weight 0 is switched off on the data side too (no tokenizing / negatives)
@@ -324,48 +365,58 @@ class MyLightningCLI(LightningCLI):
 
 
 class MetricsCSVCallback(Callback):
-    """Writes ITERATION-wise train/val losses (one row per batch) to metrics.csv.
+    """Writes epoch-level train/val losses to metrics.csv in the log directory.
 
-    Columns: epoch, step, then one column per loss component (sorted) plus `total`. Rows are
-    flushed as they are written, so the file can be tailed during training.
+    One row per epoch: `epoch`, the total train/val loss, then every enabled loss component
+    (the values Lightning aggregates over the epoch via ``self.log(..., on_epoch=True)``).
     """
 
     def __init__(self):
         super().__init__()
         self.metrics_path = None
-        self._file = None
         self._writer = None
-        self._cols = None
+        self._file = None
 
-    def on_fit_start(self, trainer, pl_module):
-        if not trainer.is_global_zero:
-            return
-        log_dir = trainer.log_dir or trainer.default_root_dir
+    def _init_writer(self, log_dir, components):
+        self._components = components
         self.metrics_path = Path(log_dir) / "metrics.csv"
         self._file = open(self.metrics_path, "w", newline="")
         self._writer = csv.writer(self._file)
+        self._keys = ["train_loss", "val_loss"] + [
+            f"{st}_loss_{n}" for n in self._components for st in ("train", "val")
+        ]
+        self._writer.writerow(["epoch"] + self._keys)
 
-    def _write(self, trainer, pl_module, stage):
-        if self._writer is None or not trainer.is_global_zero:
+    def on_fit_start(self, trainer, pl_module):
+        log_dir = trainer.log_dir or trainer.default_root_dir
+        hp = pl_module.hparams
+        components = [
+            n for n, on in (
+                ("global", hp.w_global > 0),
+                ("dense_cap", hp.w_dense_cap > 0),
+                ("dense_cap_cf", hp.w_dense_cap_cf > 0 and hp.precomputed_text),
+                ("dense", hp.w_dense > 0),
+                ("dense_counter", hp.w_dense > 0 and hp.w_counter > 0),
+                ("dense_threshold", hp.w_dense > 0 and hp.w_threshold > 0),
+                ("kw_counter", hp.use_keywords and hp.w_counter > 0),
+                ("kw_threshold", hp.use_keywords and hp.w_threshold > 0),
+                ("region", hp.use_masks and hp.w_region > 0),
+                ("uniform", hp.w_uniform > 0),
+                ("silhouette", hp.w_silhouette > 0),
+            ) if on
+        ]
+        self._init_writer(log_dir, components)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if not trainer.is_global_zero:
             return
-        rec = getattr(pl_module, "_last_step", None)
-        if rec is None:
-            return
-        st, _, comps = rec
-        if st != stage:
-            return
-        if self._cols is None:
-            self._cols = ["epoch", "step"] + sorted(comps)
-            self._writer.writerow(self._cols)
-        self._writer.writerow([trainer.current_epoch, trainer.global_step]
-                              + [comps.get(c, "") for c in self._cols[2:]])
+        epoch = trainer.current_epoch
+        row = []
+        for k in self._keys:
+            v = trainer.callback_metrics.get(k)
+            row.append(v.item() if v is not None else "")
+        self._writer.writerow([epoch] + row)
         self._file.flush()
-
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        self._write(trainer, pl_module, "train")
-
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
-        self._write(trainer, pl_module, "val")
 
 
 def cli_main(default_config_filename="./configs/default.yaml"):
@@ -402,9 +453,18 @@ def cli_main(default_config_filename="./configs/default.yaml"):
     dir_log_cfg = Path(cli.trainer.log_dir) / dirname_cfg
     dir_log_cfg.mkdir(parents=True, exist_ok=True)
 
+    ckpt_path = None
+    # LightningCLI stores parsed args in config
+    if hasattr(cli, "config") and isinstance(cli.config, dict):
+        ckpt_path = cli.config.get("ckpt_path")
+    # Fallback to parser namespace if present
+    if ckpt_path is None and hasattr(cli, "trainer") and hasattr(cli.trainer, "default_root_dir"):
+        pass
+
     cli.trainer.fit(
         model=cli.model,
         datamodule=cli.datamodule,
+        ckpt_path=ckpt_path,
     )
 
 
