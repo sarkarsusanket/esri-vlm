@@ -1,0 +1,63 @@
+# Supervised fine-tuning of a pretrained CLIP on (image, caption) parquet data.
+#
+#   python sft/train.py \
+#       --model.ckpt_path=/path/to/epoch=XX-step=YY.ckpt \
+#       --data.data_dir=/path/to/parquets
+#
+# Required (no default): model.ckpt_path, data.data_dir.
+# The checkpoint is the source of truth for the towers, tokenizer and image_resolution /
+# context_length; the datamodule is synced from it at startup. To fine-tune at a different
+# resolution pass e.g. --model.image_resolution=336.
+seed_everything: 0
+
+# Weights & Biases (also settable with --use_wandb etc.)
+use_wandb: true
+wandb_project: esri-vlm-sft
+wandb_entity: null
+wandb_tags: null
+wandb_offline: false
+wandb_every_n_steps: 50
+
+model:
+  ckpt_path: /home/susanket/esri-vlm/esri-vlm/so2wt9zp/checkpoints/epoch=6-step=41349.ckpt                 # REQUIRED: path to a pretraining checkpoint (.ckpt)
+  # Frozen-tower fast path: run `python sft/precompute.py ...` once, then point this at its output.
+  # Only the two linear projections (+ logit scale/bias) are trained; no DINO/Qwen forward.
+  precomputed_features: null      # e.g. /data/susanket/vlm/sft_features
+  loss_type: siglip               # clip | siglip
+  freeze_image_tower: true
+  freeze_text_tower: true
+  text_cache_size: 256              # 0 disables the frozen-text LRU cache (SFT updates the tower)
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  min_lr_ratio: 0.0
+  gather_across_gpus: false       # true -> contrastive negatives span all ranks
+
+data:
+  data_dir: /data/susanket/vlm/sft/ # REQUIRED: directory containing *.parquet (image + caption)
+  precomputed_dir: null           # auto-filled from model.precomputed_features
+  image_col: image_bytes          # column with encoded image bytes
+  caption_col: caption               # null -> auto-detect (caption/summary/dense_caption/...)
+  image_path_col: null            # set (with image_root) to read images from disk instead of bytes
+  image_root: null
+  batch_size: 4096               # precomputed mode: pure linear probes, H100 handles this easily
+  num_workers: 8                 # only used by the online (non-precomputed) path
+  val_fraction: 0.05
+  split_seed: 0
+  crop_scale: [0.5, 1.0]
+  hflip_prob: 0.0
+  row_group_cache: 4
+  drop_last: true
+  # image_resolution / context_length / tokenizer_name are filled from the checkpoint
+
+trainer:
+  accelerator: auto
+  devices: auto
+  precision: bf16-mixed
+  max_epochs: 50
+  accumulate_grad_batches: 1
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+  default_root_dir: runs/sft
+
+

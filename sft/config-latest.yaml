@@ -1,0 +1,85 @@
+# lightning.pytorch==2.6.5
+seed_everything: 0
+trainer:
+  accelerator: auto
+  strategy: auto
+  devices: auto
+  num_nodes: 1
+  precision: bf16-mixed
+  logger: null
+  callbacks: null
+  fast_dev_run: false
+  max_epochs: 50
+  min_epochs: null
+  max_steps: -1
+  min_steps: null
+  max_time: null
+  limit_train_batches: null
+  limit_val_batches: null
+  limit_test_batches: null
+  limit_predict_batches: null
+  overfit_batches: 0.0
+  val_check_interval: null
+  check_val_every_n_epoch: 1
+  num_sanity_val_steps: null
+  log_every_n_steps: 10
+  enable_checkpointing: null
+  enable_progress_bar: null
+  enable_model_summary: null
+  accumulate_grad_batches: 1
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: null
+  deterministic: null
+  benchmark: null
+  inference_mode: true
+  use_distributed_sampler: true
+  profiler: null
+  detect_anomaly: false
+  barebones: false
+  plugins: null
+  sync_batchnorm: false
+  reload_dataloaders_every_n_epochs: 0
+  default_root_dir: runs/sft
+  enable_autolog_hparams: true
+  model_registry: null
+model:
+  ckpt_path: /home/susanket/esri-vlm/esri-vlm/so2wt9zp/checkpoints/epoch=6-step=41349.ckpt
+  image_resolution: null
+  context_length: null
+  loss_type: siglip
+  freeze_image_tower: true
+  freeze_text_tower: true
+  text_cache_size: 256
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  min_lr_ratio: 0.0
+  gather_across_gpus: false
+  w_relational: 0.1
+data:
+  data_dir: /data/susanket/vlm/sft/
+  image_col: image_bytes
+  caption_col: caption
+  image_path_col: null
+  image_root: null
+  batch_size: 1024
+  num_workers: 8
+  val_fraction: 0.05
+  split_seed: 0
+  crop_scale:
+  - 0.5
+  - 1.0
+  hflip_prob: 0.0
+  row_group_cache: 4
+  drop_last: true
+  image_resolution: 224
+  context_length: 256
+  tokenizer_name: Qwen/Qwen3-Embedding-0.6B
+use_wandb: true
+wandb_project: esri-vlm-sft
+wandb_entity: null
+wandb_tags: null
+wandb_offline: false
+wandb_every_n_steps: 50
+optimizer: null
+lr_scheduler: null

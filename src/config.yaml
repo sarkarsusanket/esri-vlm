@@ -1,3 +1,11 @@
+# ---- Weights & Biases tracking (losses, GPU util/mem, CPU/RAM, lr, throughput, hparams)
+use_wandb: true
+wandb_project: "esri-vlm"
+wandb_entity: null            # set your W&B team/user if needed
+wandb_tags:  "dinov2,qwen30.6,siglip,MRL"              # e.g. "mrl,dinov2,siglip"
+wandb_offline: false          # true -> log locally, sync later with `wandb sync`
+wandb_every_n_steps: 100       # sampling cadence for GPU/CPU/RAM metrics
+
 model:
   # ---- pretrained towers (embeddings are just projected into the shared space)
   text_model_name: "Qwen/Qwen3-Embedding-0.6B"
@@ -22,6 +30,9 @@ model:
 
   # ---- losses
   loss_type: siglip              # clip | siglip   (siglip: scale=log 10, learnable bias=-10)
+  use_mrl: true                 # Matryoshka Representation Learning: also apply every loss on the
+                                 # nested prefixes below and sum them into the final loss
+  mrl_dims: [64, 128, 256]       # nested widths; the full embed_dim (256) is always included last
   use_masks: false             # true -> load masks + region-level loss; false -> nothing mask-related runs
   use_hard_negatives: true     # dense hard negatives: precomputed cf sentences when precomputed_text,
                                # rule-based mutations otherwise (needs w_dense > 0)
@@ -43,6 +54,10 @@ model:
   # geometry regularisers
   w_uniform: 0.3
   w_silhouette: 0.1
+  w_relational: 0.5            # (1/B) sum_i [cos_pre(i,j) - cos_post(i,j)] on precomputed
+                               # image CLS + caption EOS states; 0 disables
+  relational_pairing: perm     # how j is chosen: perm | shift | all
+  relational_squared: false    # true -> mean((cos_pre - cos_post)^2) (structure matching)
   region_min_coverage: 0.1     # a patch counts for a region if >= 10% of it is inside the mask
   text_cache_size: 50000       # LRU cache of frozen Qwen pooled states for repeated texts
                                # (keyword groups are re-encoded every step); 0 disables
@@ -51,12 +66,12 @@ data:
   data_dir: "/data/susanket/vlm/images3"   # image-xx.parquet, image-xx/<stem>.npy (DINOv2 embs), caption-xx.parquet, masks/
   image_col: "image_bytes"   # only read when precomputed_image is false
   batch_size: 1024
-  num_workers: 50
+  num_workers: 30
   val_fraction: 0.1
   split_seed: 0
   # dense captions / hard negatives
   dense_max_sentences: 5
-  hard_neg_per_image: 2        # sentences per image that get a negative twin (the cf_dense_caption
+  hard_neg_per_image: 4        # sentences per image that get a negative twin (the cf_dense_caption
                                # row when precomputed_text, a mutated sentence otherwise)
   hard_neg_mut_count: 1        # edits per mutated sentence (only when text embs are not precomputed)
   hard_neg_hardness: 0.5       # mutation hardness (only when text embs are not precomputed)

@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = "1,2"
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', "1,2")
 
 from typing import Optional
 
@@ -312,3 +312,51 @@ class SilhouetteLoss(nn.Module):
         b = means.min(1).values
         sil = (b - a) / torch.maximum(a, b).clamp_min(1e-8)
         return -sil.mean()
+
+
+class RelationalLoss(nn.Module):
+    r"""Keep the *pairwise relational structure* of the pre-projector features after projection.
+
+    ``pre`` are the frozen backbone features (the precomputed image CLS / text EOS states coming
+    out of the ``.npy`` files) and ``post`` are the same samples after the linear projector. For
+    every selected pair ``(i, j)`` the loss asks for the cosine similarities to agree::
+
+        loss = (1 / B) * sum_i [ cos(pre_i, pre_j) - cos(post_i, post_j) ]
+
+    and the caller adds the image and text terms. ``pre`` is detached: only the projected space is
+    shaped. ``pairing`` chooses ``j``:
+
+    * ``"perm"``  -- a random bijection over the batch (default; exactly ``1/B`` pairs);
+    * ``"shift"`` -- ``j = (i + 1) % B`` (deterministic);
+    * ``"all"``   -- every off-diagonal pair (the mean is over ``B * (B - 1)`` pairs).
+
+    Note: minimising the *raw* difference pushes every ``cos(post_i, post_j)`` towards +1 (the
+    representation-collapse direction). ``squared=True`` turns it into the usual structure-matching
+    objective ``mean((cos_pre - cos_post)^2)``, which is minimised when the two structures agree.
+    """
+
+    def __init__(self, pairing: str = "perm", squared: bool = False):
+        super().__init__()
+        if pairing not in ("perm", "shift", "all"):
+            raise ValueError(f"pairing must be 'perm', 'shift' or 'all', got {pairing!r}")
+        self.pairing = pairing
+        self.squared = squared
+
+    def forward(self, pre: torch.Tensor, post: torch.Tensor) -> torch.Tensor:
+        pre = F.normalize(pre.detach().to(post.dtype), dim=-1)
+        post = F.normalize(post, dim=-1)
+        b = pre.shape[0]
+        if b < 2:
+            return _zero(post)
+
+        if self.pairing == "all":
+            sim_pre = pre @ pre.t()
+            sim_post = post @ post.t()
+            off = ~torch.eye(b, dtype=torch.bool, device=pre.device)
+            diff = (sim_pre - sim_post)[off]
+        else:
+            idx = ((torch.arange(b, device=pre.device) + 1) % b if self.pairing == "shift"
+                   else torch.randperm(b, device=pre.device))
+            diff = (pre * pre[idx]).sum(-1) - (post * post[idx]).sum(-1)
+
+        return (diff * diff).mean() if self.squared else diff.mean()

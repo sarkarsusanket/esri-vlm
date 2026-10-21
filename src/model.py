@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = "1,2"
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', "1,2")
 
 from collections import OrderedDict
 from typing import Dict, Tuple, Union, Optional
@@ -589,6 +589,20 @@ class DINOv2ImageTower(nn.Module):
             return cls, self.proj(patches.to(dtype))
         return cls
 
+    def encode_pre(self, x: torch.Tensor) -> torch.Tensor:
+        """Pooled backbone output *before* the linear projector, (B, hidden_dim).
+
+        With ``precomputed=True`` this is simply the CLS token of the supplied features; otherwise
+        the (frozen) DINOv2 backbone runs. Always detached: the relational loss only shapes the
+        space *after* the projection.
+        """
+        if self.precomputed:
+            if x.ndim == 3:
+                return x[:, 0].detach()
+            return x.detach()
+        feats = self.backbone.forward_features(x.type(self.proj.weight.dtype))
+        return feats["x_norm_clstoken"].detach()
+
 
 class QwenTextTower(nn.Module):
     """Qwen3-Embedding backbone (frozen by default) + a trainable linear projection.
@@ -685,6 +699,16 @@ class QwenTextTower(nn.Module):
                              f"got {tuple(pooled.shape)}")
         return self.proj(pooled.to(self.proj.weight.dtype))
 
+    def forward_pre(self, input_ids: torch.Tensor,
+                    attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Pooled (EOS) backbone state *before* the projector, (B, hidden_dim), detached."""
+        if attention_mask is None:
+            if self.pad_token_id is None:
+                attention_mask = torch.ones_like(input_ids)
+            else:
+                attention_mask = (input_ids != self.pad_token_id).long()
+        return self._pooled(input_ids, attention_mask).detach()
+
 
 class CLIP(nn.Module):
     """Image/text towers with a shared embedding space.
@@ -763,6 +787,17 @@ class CLIP(nn.Module):
     def encode_text_emb(self, emb: torch.Tensor) -> torch.Tensor:
         """Projected text features for precomputed pooled (EOS) hidden states, (N, hidden_dim) -> (N, embed_dim)."""
         return self.transformer.forward_emb(emb)
+
+    # ---- pre-projector (backbone) features, for the relational loss -------------------------
+    def encode_image_pre(self, image) -> torch.Tensor:
+        """Pooled image backbone output before the linear probe, (B, hidden_dim)."""
+        return self.visual.encode_pre(image)
+
+    def encode_text_pre(self, tokens) -> torch.Tensor:
+        """Pooled text backbone output before the linear probe, (B, hidden_dim)."""
+        if isinstance(tokens, dict):
+            return self.transformer.forward_pre(tokens["input_ids"], tokens["attention_mask"])
+        return self.transformer.forward_pre(tokens)
 
     def forward(self, image, text):
         image_features = self.encode_image(image)
