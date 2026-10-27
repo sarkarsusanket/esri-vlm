@@ -12,7 +12,7 @@ parquets with ~256-1024 rows/group keeps it fast (a warning is printed otherwise
 from __future__ import annotations
 
 import os
-os.environ.setdefault('CUDA_VISIBLE_DEVICES', "3")
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', "1,2")
 
 import io
 import json

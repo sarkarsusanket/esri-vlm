@@ -1,7 +1,11 @@
 """ClipCollator batch-layout tests (needs torch + lightning). Run: python tests/test_collator.py"""
 from __future__ import annotations
 
+import hashlib
+import json
+import random
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +14,7 @@ import torch
 SRC = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SRC))
 
-from data import ClipCollator  # noqa: E402
+from data import ClipCollator, KeywordEmbeddings  # noqa: E402
 
 H = 6  # fake hidden dim
 
@@ -95,6 +99,21 @@ def test_precomputed_empty_dense_group():
     assert "dense_pos" not in batch
 
 
+def test_precomputed_translated_group():
+    """Translations are a compact bank with a row->image mapping; missing ones are dropped."""
+    coll = ClipCollator(StubTokenizer(), context_length=8, grid=2)
+    s0 = base(0, summary_emb=emb(1.0), translated_emb=emb(7.0))
+    s1 = base(1, summary_emb=emb(1.1))  # no translation
+    s2 = base(2, summary_emb=emb(1.2), translated_emb=emb(8.0))
+    batch = coll([s0, s1, s2])
+    assert batch["translated_emb"].shape == (2, H)
+    assert batch["translated_img"].tolist() == [0, 2]
+    assert batch["translated_emb"][:, 0].tolist() == [7.0, 8.0]
+
+    batch2 = coll([s1])
+    assert "translated_emb" not in batch2 and "translated_img" not in batch2
+
+
 def test_tokenised_mode_unchanged():
     """Samples without *_emb keys keep the old string path."""
     coll = ClipCollator(StubTokenizer(), context_length=8, grid=2)
@@ -112,9 +131,37 @@ def test_tokenised_mode_unchanged():
     assert batch["dense_neg"][0].sum() == 1                  # one mutated twin
 
 
+def test_precomputed_keyword_sums():
+    """Keyword combinations and region texts use the summed individual EOS rows."""
+    words = ["kw0a", "kw0b", "kw1a", "kw1b", "other a", "other b", "other c", "road"]
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        rows = np.arange(len(words) * H, dtype=np.float32).reshape(len(words), H) + 1
+        np.save(root / "keywords.npy", rows.astype(np.float16))
+        with open(root / "keywords.json", "w") as f:
+            json.dump(sorted(words), f)
+        store = KeywordEmbeddings(root)
+        coll = ClipCollator(StubTokenizer(), context_length=8, grid=2, keyword_emb_dir=root)
+        s0 = base(0, region_kws=["road"], region_cov=np.ones((1, 2, 2), np.float32))
+        s1 = base(1)
+        batch = coll([s0, s1])
+        assert "kw_emb" in batch and "kw_tokens" not in batch
+        assert "region_emb" in batch and "region_tokens" not in batch
+
+        samples = [s0, s1]
+        key = "|".join(sorted({k for s in samples for k in s["keywords"]}))
+        rng = random.Random(int.from_bytes(hashlib.md5(key.encode()).digest()[:8], "little"))
+        uniq, pos, neg = coll._keyword_batch([s["keywords"] for s in samples], rng)
+        expect = np.stack([store.sum_rows(kws) for kws in uniq])
+        assert np.allclose(batch["kw_emb"].numpy(), expect)
+        assert torch.equal(batch["kw_pos"], pos) and torch.equal(batch["kw_neg"], neg)
+        assert np.allclose(batch["region_emb"][0].numpy(), store.sum_rows(("road",)))
+
+
 def run_all():
     for fn in (test_precomputed_dense_group, test_precomputed_cf_paragraph_group,
-               test_precomputed_empty_dense_group, test_tokenised_mode_unchanged):
+               test_precomputed_translated_group, test_precomputed_empty_dense_group,
+               test_tokenised_mode_unchanged, test_precomputed_keyword_sums):
         fn()
         print("PASS", fn.__name__)
 

@@ -1,9 +1,12 @@
 """
-Image-Text Cross-Modal Evaluation Script (Class-based Folders + Parquet Caption Datasets)
+Image-Text Cross-Modal Evaluation Script (Class-based Folders + Parquet Caption Datasets with MRL Support)
 
 Usage:
-    python eval.py --ckpt_path path/to/checkpoint.ckpt
+    python eval/eval.py --ckpt_path /home/susanket/esri-vlm/esri-vlm/ddvi5ics/checkpoints/epoch=3-step=23628.ckpt --output /home/susanket/esri-vlm/esri-vlm/ddvi5ics/eval.html --mrl_dims 64 128 256
 """
+import os
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', "1,2")
+
 
 import argparse
 import io
@@ -24,13 +27,54 @@ from torchvision import transforms
 from transformers import AutoTokenizer
 
 sys.path.append(rf"/home/susanket/esri-vlm/src")
+sys.path.append(rf"/home/susanket/esri-vlm")
 from model import CLIP, build_model
 from main import CLIPLightningModule
+from sft.loader import load_pretrained_clip
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 BENCHMARK_ROOT = rf"/data/susanket/vlm/eval"
+
+
+
+
+# ==========================================
+# Checkpoint loading
+# ==========================================
+
+def is_sft_checkpoint(ckpt: dict) -> bool:
+    """SFT checkpoints store the base pretraining checkpoint + precomputed features switch."""
+    hp = ckpt.get("hyper_parameters", {})
+    return "ckpt_path" in hp and "precomputed_features" in hp
+
+
+def load_sft_clip(ckpt: dict, device: torch.device):
+    """Rebuild a full CLIP from an SFT checkpoint (both full-backbone and precomputed modes)."""
+    hp = dict(ckpt["hyper_parameters"])
+    clip, tokenizer, _ = load_pretrained_clip(
+        ckpt_path=hp["ckpt_path"],
+        freeze_image_tower=True,
+        freeze_text_tower=True,
+        text_cache_size=0,
+        device=str(device),
+        verbose=False,
+    )
+    state = ckpt["state_dict"]
+
+    if any(k.startswith("model.") for k in state):  # SFT ran with real backbones
+        sub = {k[len("model."):]: v for k, v in state.items() if k.startswith("model.")}
+        clip.load_state_dict(sub, strict=False)
+    else:  # precomputed SFT: transfer the trained probes into the real towers
+        with torch.no_grad():
+            clip.visual.proj.weight.copy_(state["image_proj.weight"])
+            clip.transformer.proj.weight.copy_(state["text_proj.weight"])
+            clip.logit_scale.copy_(state["_logit_scale"].reshape(()))
+            if clip.logit_bias is not None and state.get("_logit_bias") is not None:
+                clip.logit_bias.copy_(state["_logit_bias"].reshape(()))
+
+    return clip.to(device).eval(), tokenizer
 
 
 # ==========================================
@@ -178,23 +222,13 @@ def encode_prompts(model: CLIP, tokenizer, prompts: List[str], device: torch.dev
 # ==========================================
 
 def compute_retrieval_metrics(sim_matrix: np.ndarray, is_1to1: bool = False, img_labels: np.ndarray = None):
-    """
-    Computes T2I and I2T Recall@1, 5, 10.
-    
-    sim_matrix shape: (N_text, N_image)
-    - If is_1to1=True: Text i matches Image i.
-    - If is_1to1=False: Text i represents class i, matching images with img_labels == i.
-    """
     n_text, n_img = sim_matrix.shape
 
     # 1. Text-to-Image (T2I)
     t2i_r1, t2i_r5, t2i_r10 = 0.0, 0.0, 0.0
     for i in range(n_text):
         ranks = np.argsort(-sim_matrix[i, :])
-        if is_1to1:
-            matched = (ranks == i)
-        else:
-            matched = (img_labels[ranks] == i)
+        matched = (ranks == i) if is_1to1 else (img_labels[ranks] == i)
         
         hit_ranks = np.where(matched)[0]
         if len(hit_ranks) > 0:
@@ -213,10 +247,7 @@ def compute_retrieval_metrics(sim_matrix: np.ndarray, is_1to1: bool = False, img
     i2t_r1, i2t_r5, i2t_r10 = 0.0, 0.0, 0.0
     for j in range(n_img):
         ranks = np.argsort(-sim_matrix[:, j])
-        if is_1to1:
-            matched = (ranks == j)
-        else:
-            matched = (ranks == img_labels[j])
+        matched = (ranks == j) if is_1to1 else (ranks == img_labels[j])
 
         hit_ranks = np.where(matched)[0]
         if len(hit_ranks) > 0:
@@ -235,11 +266,6 @@ def compute_retrieval_metrics(sim_matrix: np.ndarray, is_1to1: bool = False, img
 
 
 def compute_classification_accuracy(sim_matrix: np.ndarray, img_labels: np.ndarray) -> Dict[str, float]:
-    """
-    Computes zero-shot image classification accuracy over classes.
-    sim_matrix: (num_classes, num_images)
-    """
-    # Transpose similarity matrix to (num_images, num_classes)
     logits = sim_matrix.T  
     probs = F.softmax(torch.tensor(logits), dim=-1).numpy()
 
@@ -263,11 +289,37 @@ def compute_classification_accuracy(sim_matrix: np.ndarray, img_labels: np.ndarr
 
 
 # ==========================================
-# Evaluation Processors
+# Evaluation Processors (with MRL breakdown)
 # ==========================================
 
-def evaluate_image_class(model: CLIP, tokenizer, dataset_dir: Path, device: torch.device, batch_size: int, image_size: int) -> Dict:
-    """Runs evaluation on a class-based folder dataset."""
+def evaluate_mrl_metrics(txt_emb_full: np.ndarray, img_emb_full: np.ndarray, mrl_dims: List[int], is_1to1: bool, img_labels: np.ndarray = None, evaluate_cls: bool = False) -> Dict[int, Dict]:
+    mrl_results = {}
+    max_dim = txt_emb_full.shape[1]
+
+    for dim in mrl_dims:
+        if dim > max_dim:
+            continue
+        
+        txt_sub = txt_emb_full[:, :dim]
+        img_sub = img_emb_full[:, :dim]
+        
+        txt_sub = txt_sub / np.linalg.norm(txt_sub, axis=-1, keepdims=True)
+        img_sub = img_sub / np.linalg.norm(img_sub, axis=-1, keepdims=True)
+        
+        sim_matrix = txt_sub @ img_sub.T
+        retrieval_metrics = compute_retrieval_metrics(sim_matrix, is_1to1=is_1to1, img_labels=img_labels)
+        
+        dim_res = {**retrieval_metrics}
+        if evaluate_cls and img_labels is not None:
+            cls_metrics = compute_classification_accuracy(sim_matrix, img_labels)
+            dim_res.update(cls_metrics)
+            
+        mrl_results[dim] = dim_res
+
+    return mrl_results
+
+
+def evaluate_image_class(model: CLIP, tokenizer, dataset_dir: Path, device: torch.device, batch_size: int, image_size: int, mrl_dims: List[int]) -> Dict:
     dataset = ImageFolderFlat(str(dataset_dir), image_size=image_size)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
@@ -276,34 +328,38 @@ def evaluate_image_class(model: CLIP, tokenizer, dataset_dir: Path, device: torc
     prompts = [f"{cls.replace('_', ' ')}" for cls in dataset.class_names]
     txt_emb = encode_prompts(model, tokenizer, prompts, device)
 
-    sim_matrix = txt_emb @ img_emb.T  # (num_classes, num_images)
+    sim_matrix_full = txt_emb @ img_emb.T
+    retrieval_metrics_full = compute_retrieval_metrics(sim_matrix_full, is_1to1=False, img_labels=img_labels)
+    cls_metrics_full = compute_classification_accuracy(sim_matrix_full, img_labels)
 
-    retrieval_metrics = compute_retrieval_metrics(sim_matrix, is_1to1=False, img_labels=img_labels)
-    cls_metrics = compute_classification_accuracy(sim_matrix, img_labels)
+    mrl_metrics = evaluate_mrl_metrics(txt_emb, img_emb, mrl_dims, is_1to1=False, img_labels=img_labels, evaluate_cls=True)
 
     return {
         "num_images": len(dataset),
         "num_classes": len(dataset.class_names),
-        **retrieval_metrics,
-        **cls_metrics
+        **retrieval_metrics_full,
+        **cls_metrics_full,
+        "mrl_metrics": mrl_metrics
     }
 
 
-def evaluate_image_cap(model: CLIP, tokenizer, parquet_path: Path, device: torch.device, batch_size: int, image_size: int) -> Dict:
-    """Runs evaluation on an image-caption parquet dataset."""
+def evaluate_image_cap(model: CLIP, tokenizer, parquet_path: Path, device: torch.device, batch_size: int, image_size: int, mrl_dims: List[int]) -> Dict:
     dataset = ParquetCaptionDataset(str(parquet_path), image_size=image_size)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
     img_emb, captions = encode_images_in_batches(model, loader, device)
     txt_emb = encode_prompts(model, tokenizer, captions, device)
 
-    sim_matrix = txt_emb @ img_emb.T  # (N, N)
-    retrieval_metrics = compute_retrieval_metrics(sim_matrix, is_1to1=True)
+    sim_matrix_full = txt_emb @ img_emb.T
+    retrieval_metrics_full = compute_retrieval_metrics(sim_matrix_full, is_1to1=True)
+
+    mrl_metrics = evaluate_mrl_metrics(txt_emb, img_emb, mrl_dims, is_1to1=True, evaluate_cls=False)
 
     return {
         "num_images": len(dataset),
-        "T2I_R@1": retrieval_metrics["T2I_R@1"],
-        "I2T_R@1": retrieval_metrics["I2T_R@1"]
+        "T2I_R@1": retrieval_metrics_full["T2I_R@1"],
+        "I2T_R@1": retrieval_metrics_full["I2T_R@1"],
+        "mrl_metrics": mrl_metrics
     }
 
 
@@ -316,63 +372,151 @@ def generate_html_report(
     benchmark_root: str,
     class_results: Dict[str, Dict],
     cap_results: Dict[str, Dict],
+    mrl_dims: List[int],
     output_path: str,
 ):
-    """Generates an aesthetic dashboard HTML report."""
     ckpt_name = Path(checkpoint_path).name
 
-    # Calculate class averages
-    class_avg = defaultdict(float)
-    if class_results:
+    # Helper function to build rows for a given dataset results dict and dimension type (full or MRL dim)
+    def build_class_rows(get_metrics_fn):
+        rows_html = ""
+        for ds_name, r in sorted(class_results.items()):
+            m = get_metrics_fn(r)
+            if not m: continue
+            rows_html += f"""
+            <tr>
+                <td class="ds-name">{ds_name}</td>
+                <td>{r['num_images']:,}</td>
+                <td>{r['num_classes']}</td>
+                <td class="metric-highlight">{m.get('Acc@1', 0)*100:.2f}%</td>
+                <td>{m.get('Acc@5', 0)*100:.2f}%</td>
+                <td>{m.get('T2I_R@1', 0)*100:.2f}%</td>
+                <td>{m.get('T2I_R@5', 0)*100:.2f}%</td>
+                <td>{m.get('T2I_R@10', 0)*100:.2f}%</td>
+                <td>{m.get('I2T_R@1', 0)*100:.2f}%</td>
+                <td>{m.get('I2T_R@5', 0)*100:.2f}%</td>
+                <td>{m.get('I2T_R@10', 0)*100:.2f}%</td>
+            </tr>"""
+        return rows_html
+
+    def build_cap_rows(get_metrics_fn):
+        rows_html = ""
+        for ds_name, r in sorted(cap_results.items()):
+            m = get_metrics_fn(r)
+            if not m: continue
+            rows_html += f"""
+            <tr>
+                <td class="ds-name">{ds_name}</td>
+                <td>{r['num_images']:,}</td>
+                <td class="metric-highlight">{m.get('T2I_R@1', 0)*100:.2f}%</td>
+                <td class="metric-highlight">{m.get('I2T_R@1', 0)*100:.2f}%</td>
+            </tr>"""
+        return rows_html
+
+    def compute_class_avg(get_metrics_fn, keys):
+        avg = defaultdict(float)
+        count = len(class_results)
+        if count == 0: return avg
         for r in class_results.values():
-            for k in ["T2I_R@1", "T2I_R@5", "T2I_R@10", "I2T_R@1", "I2T_R@5", "I2T_R@10", "Acc@1", "Acc@5"]:
-                class_avg[k] += r[k]
-        for k in class_avg:
-            class_avg[k] /= len(class_results)
+            m = get_metrics_fn(r)
+            for k in keys:
+                avg[k] += m.get(k, 0)
+        for k in avg: avg[k] /= count
+        return avg
 
-    # Calculate caption averages
-    cap_avg = defaultdict(float)
-    if cap_results:
+    def compute_cap_avg(get_metrics_fn, keys):
+        avg = defaultdict(float)
+        count = len(cap_results)
+        if count == 0: return avg
         for r in cap_results.values():
-            for k in ["T2I_R@1", "I2T_R@1"]:
-                cap_avg[k] += r[k]
-        for k in cap_avg:
-            cap_avg[k] /= len(cap_results)
+            m = get_metrics_fn(r)
+            for k in keys:
+                avg[k] += m.get(k, 0)
+        for k in avg: avg[k] /= count
+        return avg
 
-    # Class rows
-    class_rows_html = ""
-    for ds_name, r in sorted(class_results.items()):
-        class_rows_html += f"""
-        <tr>
-            <td class="ds-name">{ds_name}</td>
-            <td>{r['num_images']:,}</td>
-            <td>{r['num_classes']}</td>
-            <td class="metric-highlight">{r['Acc@1']*100:.2f}%</td>
-            <td>{r['Acc@5']*100:.2f}%</td>
-            <td>{r['T2I_R@1']*100:.2f}%</td>
-            <td>{r['T2I_R@5']*100:.2f}%</td>
-            <td>{r['T2I_R@10']*100:.2f}%</td>
-            <td>{r['I2T_R@1']*100:.2f}%</td>
-            <td>{r['I2T_R@5']*100:.2f}%</td>
-            <td>{r['I2T_R@10']*100:.2f}%</td>
-        </tr>"""
+    class_keys = ["Acc@1", "Acc@5", "T2I_R@1", "T2I_R@5", "T2I_R@10", "I2T_R@1", "I2T_R@5", "I2T_R@10"]
+    cap_keys = ["T2I_R@1", "I2T_R@1"]
 
-    # Caption rows
-    cap_rows_html = ""
-    for ds_name, r in sorted(cap_results.items()):
-        cap_rows_html += f"""
-        <tr>
-            <td class="ds-name">{ds_name}</td>
-            <td>{r['num_images']:,}</td>
-            <td class="metric-highlight">{r['T2I_R@1']*100:.2f}%</td>
-            <td class="metric-highlight">{r['I2T_R@1']*100:.2f}%</td>
-        </tr>"""
+    # Generate Full Dimension Section
+    full_class_rows = build_class_rows(lambda r: r)
+    full_class_avg = compute_class_avg(lambda r: r, class_keys)
+    full_cap_rows = build_cap_rows(lambda r: r)
+    full_cap_avg = compute_cap_avg(lambda r: r, cap_keys)
+
+    sections_html = f"""
+    <div class="section-title"><span>Full Dimension Evaluation</span> <span class="badge">Base Embeddings</span></div>
+    
+    <div class="card">
+        <h3>Image-Class Benchmarks</h3>
+        <table>
+            <thead>
+                <tr><th>Dataset</th><th>Images</th><th>Classes</th><th>Acc@1</th><th>Acc@5</th><th>T2I R@1</th><th>T2I R@5</th><th>T2I R@10</th><th>I2T R@1</th><th>I2T R@5</th><th>I2T R@10</th></tr>
+            </thead>
+            <tbody>
+                {full_class_rows}
+                {f'<tr class="avg-row"><td>Average</td><td>-</td><td>-</td><td>{full_class_avg["Acc@1"]*100:.2f}%</td><td>{full_class_avg["Acc@5"]*100:.2f}%</td><td>{full_class_avg["T2I_R@1"]*100:.2f}%</td><td>{full_class_avg["T2I_R@5"]*100:.2f}%</td><td>{full_class_avg["T2I_R@10"]*100:.2f}%</td><td>{full_class_avg["I2T_R@1"]*100:.2f}%</td><td>{full_class_avg["I2T_R@5"]*100:.2f}%</td><td>{full_class_avg["I2T_R@10"]*100:.2f}%</td></tr>' if class_results else ''}
+            </tbody>
+        </table>
+    </div>
+
+    <div class="card">
+        <h3>Image-Caption Benchmarks</h3>
+        <table>
+            <thead>
+                <tr><th>Dataset</th><th>Images</th><th>T2I R@1</th><th>I2T R@1</th></tr>
+            </thead>
+            <tbody>
+                {full_cap_rows}
+                {f'<tr class="avg-row"><td>Average</td><td>-</td><td>{full_cap_avg["T2I_R@1"]*100:.2f}%</td><td>{full_cap_avg["I2T_R@1"]*100:.2f}%</td></tr>' if cap_results else ''}
+            </tbody>
+        </table>
+    </div>
+    """
+
+    # Generate Separate Tables for each MRL Dimension
+    for dim in mrl_dims:
+        dim_class_rows = build_class_rows(lambda r: r.get("mrl_metrics", {}).get(dim, {}))
+        dim_class_avg = compute_class_avg(lambda r: r.get("mrl_metrics", {}).get(dim, {}), class_keys)
+        
+        dim_cap_rows = build_cap_rows(lambda r: r.get("mrl_metrics", {}).get(dim, {}))
+        dim_cap_avg = compute_cap_avg(lambda r: r.get("mrl_metrics", {}).get(dim, {}), cap_keys)
+
+        sections_html += f"""
+        <div class="section-title" style="margin-top: 48px;"><span>MRL Dimension: {dim}</span> <span class="badge">Truncated Embeddings</span></div>
+        
+        <div class="card">
+            <h3>Image-Class Benchmarks (Dim {dim})</h3>
+            <table>
+                <thead>
+                    <tr><th>Dataset</th><th>Images</th><th>Classes</th><th>Acc@1</th><th>Acc@5</th><th>T2I R@1</th><th>T2I R@5</th><th>T2I R@10</th><th>I2T R@1</th><th>I2T R@5</th><th>I2T R@10</th></tr>
+                </thead>
+                <tbody>
+                    {dim_class_rows}
+                    {f'<tr class="avg-row"><td>Average</td><td>-</td><td>-</td><td>{dim_class_avg["Acc@1"]*100:.2f}%</td><td>{dim_class_avg["Acc@5"]*100:.2f}%</td><td>{dim_class_avg["T2I_R@1"]*100:.2f}%</td><td>{dim_class_avg["T2I_R@5"]*100:.2f}%</td><td>{dim_class_avg["T2I_R@10"]*100:.2f}%</td><td>{dim_class_avg["I2T_R@1"]*100:.2f}%</td><td>{dim_class_avg["I2T_R@5"]*100:.2f}%</td><td>{dim_class_avg["I2T_R@10"]*100:.2f}%</td></tr>' if class_results else ''}
+                </tbody>
+            </table>
+        </div>
+
+        <div class="card">
+            <h3>Image-Caption Benchmarks (Dim {dim})</h3>
+            <table>
+                <thead>
+                    <tr><th>Dataset</th><th>Images</th><th>T2I R@1</th><th>I2T R@1</th></tr>
+                </thead>
+                <tbody>
+                    {dim_cap_rows}
+                    {f'<tr class="avg-row"><td>Average</td><td>-</td><td>{dim_cap_avg["T2I_R@1"]*100:.2f}%</td><td>{dim_cap_avg["I2T_R@1"]*100:.2f}%</td></tr>' if cap_results else ''}
+                </tbody>
+            </table>
+        </div>
+        """
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>VLM Evaluation Report - {ckpt_name}</title>
+<title>VLM MRL Evaluation Report - {ckpt_name}</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
     :root {{
@@ -425,13 +569,20 @@ def generate_html_report(
         border: 1px solid var(--border);
         box-shadow: 0 1px 3px rgba(0,0,0,0.05);
         overflow: hidden;
-        margin-bottom: 32px;
+        margin-bottom: 24px;
+        padding: 16px 24px;
+    }}
+    .card h3 {{
+        margin-top: 8px;
+        font-size: 15px;
+        color: var(--text-secondary);
     }}
     table {{
         width: 100%;
         border-collapse: collapse;
         text-align: left;
         font-size: 14px;
+        margin-top: 10px;
     }}
     th {{
         background: #f1f5f9;
@@ -444,7 +595,6 @@ def generate_html_report(
         padding: 14px 16px;
         border-bottom: 1px solid var(--border);
     }}
-    tr:last-child td {{ border-bottom: none; }}
     tr:hover td {{ background: #f8fafc; }}
     .ds-name {{ font-weight: 500; color: var(--text-primary); }}
     .metric-highlight {{ font-weight: 600; color: var(--accent); }}
@@ -468,63 +618,15 @@ def generate_html_report(
 <body>
 <div class="container">
     <div class="header">
-        <h1>VLM Evaluation Dashboard</h1>
+        <h1>VLM MRL Evaluation Dashboard</h1>
         <div class="meta">
             <strong>Checkpoint:</strong> {ckpt_name} &nbsp;|&nbsp; 
-            <strong>Benchmark Root:</strong> {benchmark_root}
+            <strong>Benchmark Root:</strong> {benchmark_root} &nbsp;|&nbsp;
+            <strong>Evaluated MRL Dimensions:</strong> {mrl_dims}
         </div>
     </div>
 
-    <!-- Image-Class Section -->
-    <div class="section-title">
-        <span>Image-Class Benchmarks</span>
-        <span class="badge">Zero-Shot Classification & Retrieval</span>
-    </div>
-    <div class="card">
-        <table>
-            <thead>
-                <tr>
-                    <th>Dataset</th>
-                    <th>Images</th>
-                    <th>Classes</th>
-                    <th>Acc@1</th>
-                    <th>Acc@5</th>
-                    <th>T2I R@1</th>
-                    <th>T2I R@5</th>
-                    <th>T2I R@10</th>
-                    <th>I2T R@1</th>
-                    <th>I2T R@5</th>
-                    <th>I2T R@10</th>
-                </tr>
-            </thead>
-            <tbody>
-                {class_rows_html}
-                {'<tr class="avg-row"><td>Average</td><td>-</td><td>-</td><td>' + f"{class_avg['Acc@1']*100:.2f}%</td><td>{class_avg['Acc@5']*100:.2f}%</td><td>{class_avg['T2I_R@1']*100:.2f}%</td><td>{class_avg['T2I_R@5']*100:.2f}%</td><td>{class_avg['T2I_R@10']*100:.2f}%</td><td>{class_avg['I2T_R@1']*100:.2f}%</td><td>{class_avg['I2T_R@5']*100:.2f}%</td><td>{class_avg['I2T_R@10']*100:.2f}%</td></tr>" if class_results else ''}
-            </tbody>
-        </table>
-    </div>
-
-    <!-- Image-Cap Section -->
-    <div class="section-title">
-        <span>Image-Caption Benchmarks</span>
-        <span class="badge">Fine-Grained Retrieval</span>
-    </div>
-    <div class="card">
-        <table>
-            <thead>
-                <tr>
-                    <th>Dataset</th>
-                    <th>Images</th>
-                    <th>T2I R@1</th>
-                    <th>I2T R@1</th>
-                </tr>
-            </thead>
-            <tbody>
-                {cap_rows_html}
-                {'<tr class="avg-row"><td>Average</td><td>-</td><td>' + f"{cap_avg['T2I_R@1']*100:.2f}%</td><td>{cap_avg['I2T_R@1']*100:.2f}%</td></tr>" if cap_results else ''}
-            </tbody>
-        </table>
-    </div>
+    {sections_html}
 </div>
 </body>
 </html>"""
@@ -540,24 +642,30 @@ def generate_html_report(
 # ==========================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate CLIP checkpoint on class and caption evaluation suites.")
+    parser = argparse.ArgumentParser(description="Evaluate CLIP checkpoint on class and caption evaluation suites with MRL classification and retrieval support.")
     parser.add_argument("--ckpt_path", type=str, required=True, help="Path to .ckpt checkpoint file")
     parser.add_argument("--output", type=str, default=None, help="Output HTML path")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--mrl_dims", type=int, nargs="+", default=[64, 128, 256], help="List of MRL dimensions to evaluate")
     args = parser.parse_args()
 
-    device = torch.device(args.device) if args.device else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+    device = torch.device(args.device) if args.device else (torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
     print(f"Loading checkpoint: {args.ckpt_path}")
+    print(f"Evaluating MRL dimensions: {args.mrl_dims}")
     ckpt = torch.load(args.ckpt_path, map_location=device, weights_only=False)
 
-    if "hyper_parameters" in ckpt:
+    if is_sft_checkpoint(ckpt):
+        model, tokenizer = load_sft_clip(ckpt, device)
+    elif "hyper_parameters" in ckpt:
         for hp_key in ["eval_downstream", "air_temp_data_path", "election_data_path", "_instantiator"]:
             ckpt['hyper_parameters'].pop(hp_key, None)
 
-        lightning_model = CLIPLightningModule(**ckpt["hyper_parameters"]).to(device)
+        model_hp = dict(ckpt["hyper_parameters"])
+        model_hp["load_text_backbone"] = True  
+        lightning_model = CLIPLightningModule(**model_hp).to(device)
         lightning_model.load_state_dict(ckpt["state_dict"])
         lightning_model.eval()
         model = lightning_model.model
@@ -580,8 +688,10 @@ def main():
         for ds in sorted([d for d in class_dir.iterdir() if d.is_dir()]):
             print(f"\n[Image-Class] Evaluating {ds.name}...", end=" ", flush=True)
             t0 = time.time()
-            res = evaluate_image_class(model, tokenizer, ds, device, args.batch_size, args.image_size)
-            print(f"done ({time.time()-t0:.1f}s) | Acc@1: {res['Acc@1']*100:.2f}% | T2I R@1: {res['T2I_R@1']*100:.2f}% | I2T R@1: {res['I2T_R@1']*100:.2f}%")
+            res = evaluate_image_class(model, tokenizer, ds, device, args.batch_size, args.image_size, args.mrl_dims)
+            print(f"done ({time.time()-t0:.1f}s) | Acc@1: {res['Acc@1']*100:.2f}% | T2I R@1: {res['T2I_R@1']*100:.2f}%")
+            for dim, mrl_res in res["mrl_metrics"].items():
+                print(f"   -> MRL Dim {dim}: Acc@1: {mrl_res.get('Acc@1', 0)*100:.2f}% | T2I R@1: {mrl_res['T2I_R@1']*100:.2f}%")
             class_results[ds.name] = res
 
     # 2. Evaluate image-cap/
@@ -591,13 +701,15 @@ def main():
             ds_name = p_file.stem
             print(f"\n[Image-Cap] Evaluating {ds_name}...", end=" ", flush=True)
             t0 = time.time()
-            res = evaluate_image_cap(model, tokenizer, p_file, device, args.batch_size, args.image_size)
-            print(f"done ({time.time()-t0:.1f}s) | T2I R@1: {res['T2I_R@1']*100:.2f}% | I2T R@1: {res['I2T_R@1']*100:.2f}%")
+            res = evaluate_image_cap(model, tokenizer, p_file, device, args.batch_size, args.image_size, args.mrl_dims)
+            print(f"done ({time.time()-t0:.1f}s) | T2I R@1: {res['T2I_R@1']*100:.2f}%")
+            for dim, mrl_res in res["mrl_metrics"].items():
+                print(f"   -> MRL Dim {dim}: T2I R@1: {mrl_res['T2I_R@1']*100:.2f}%")
             cap_results[ds_name] = res
 
-    # 3. Generate HTML
-    output_path = args.output or f"eval_report_{Path(args.ckpt_path).stem}.html"
-    generate_html_report(args.ckpt_path, BENCHMARK_ROOT, class_results, cap_results, output_path)
+    # 3. Generate HTML Report
+    output_path = args.output or f"eval_report_{Path(args.ckpt_path).stem}_mrl.html"
+    generate_html_report(args.ckpt_path, BENCHMARK_ROOT, class_results, cap_results, args.mrl_dims, output_path)
 
 
 if __name__ == "__main__":

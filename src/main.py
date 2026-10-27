@@ -24,6 +24,7 @@ from loss import (
     UniformityLoss,
     SilhouetteLoss,
     RelationalLoss,
+    CrossLingualConsistencyLoss,
 )
 from data import CLIPDataModule
 
@@ -41,7 +42,9 @@ class CLIPLightningModule(pl.LightningModule):
         freeze_image_tower: bool = True,
         precomputed_image: bool = False,  # True -> datamodule feeds precomputed DINOv2 .npy embs
         precomputed_text: bool = False,   # True -> datamodule feeds precomputed Qwen EOS .npy embs
-                                          # (summary / dense / counterfactual); keywords stay tokenised
+                                          # for summary / dense / counterfactual / keywords / regions
+        load_text_backbone: Optional[bool] = None,  # None -> auto (skip when all text is precomputed);
+                                                    # True -> load it (needed to encode raw text, e.g. eval)
         # model architecture
         embed_dim: int = 512,
         image_resolution: int = 224,
@@ -53,13 +56,16 @@ class CLIPLightningModule(pl.LightningModule):
         warmup_steps: int = 2000,
         # losses
         loss_type: Literal["clip", "siglip"] = "clip",
-        use_mrl: bool = False,  # Matryoshka: also apply every loss on the nested prefixes in mrl_dims
+        use_mrl: bool = False,  # Matryoshka: apply contrastive losses on the nested prefixes in
+                                # mrl_dims (geometry losses run only at full width)
         mrl_dims: List[int] = [64, 128, 256],  # nested widths (full embed_dim is always added last)
         use_masks: bool = False,  # True -> load masks and add the region-level loss
         use_hard_negatives: bool = True,  # dense hard negatives (precomputed cf sentences when
                                           # precomputed_text, rule-based mutations otherwise; data side)
         use_keywords: bool = True,  # build positive/negative keyword groups (data side)
         w_global: float = 1.0,  # summary caption <-> image CLS
+        w_translated: float = 0.3,  # translated summary <-> image CLS (only rows that have one)
+        w_translated_consistency: float = 0.5,  # translated summary <-> English summary (mean 1-cos)
         w_dense: float = 1.0,  # individual dense sentences <-> image (multi-positive contrastive)
         w_dense_cap: float = 1.0,  # whole dense caption <-> image (GCL)
         w_dense_cap_cf: float = 1.0,  # whole dense caption (positive) vs. whole counterfactual
@@ -85,7 +91,7 @@ class CLIPLightningModule(pl.LightningModule):
         region_min_coverage: float = 0.1,  # a patch belongs to a region if >= this fraction is masked
         # tokenizer
         tokenizer_name: str = "Qwen/Qwen3-Embedding-0.6B",
-        # LRU cache of frozen Qwen pooled states for repeated texts (keyword groups); 0 disables
+        # LRU cache of frozen Qwen pooled states when text is encoded on the fly; 0 disables
         text_cache_size: int = 50000,
     ) -> None:
         super().__init__()
@@ -100,6 +106,14 @@ class CLIPLightningModule(pl.LightningModule):
         logit_kwargs = (dict(logit_scale_init=math.log(10.0), use_logit_bias=True, logit_bias_init=-10.0)
                         if loss_type == "siglip" else {})
 
+        # With precomputed text every group (including keywords and regions, whose EOS states are
+        # summed on the data side) goes through `encode_text_emb`, so the frozen Qwen backbone is
+        # never called and loading its weights would only waste time and memory.
+        auto_text_backbone = not precomputed_text
+        needs_text_backbone = auto_text_backbone if load_text_backbone is None else bool(load_text_backbone)
+        if not needs_text_backbone and not precomputed_text:
+            raise ValueError("load_text_backbone=False requires precomputed_text=True")
+
         self.model = CLIP(
             embed_dim=embed_dim,
             image_resolution=image_resolution,
@@ -111,6 +125,7 @@ class CLIPLightningModule(pl.LightningModule):
             freeze_image_tower=freeze_image_tower,
             precomputed_image=precomputed_image,
             precomputed_text=precomputed_text,
+            load_text_backbone=needs_text_backbone,
             pad_token_id=self.tokenizer.pad_token_id,
             text_cache_size=text_cache_size,
             **logit_kwargs,
@@ -124,9 +139,33 @@ class CLIPLightningModule(pl.LightningModule):
         self.silhouette_loss = SilhouetteLoss()
         self.relational_loss = RelationalLoss(pairing=relational_pairing,
                                               squared=relational_squared)
+        self.consistency_loss = CrossLingualConsistencyLoss()
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.warmup_steps = warmup_steps
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        """Keep old checkpoints compatible when a frozen backbone is / is not instantiated.
+
+        Checkpoints store the frozen backbone weights. A run that skips loading the backbone
+        (all text is precomputed) has no keys for it, and conversely a fresh run that loads the
+        backbone should not require a checkpoint to contain those frozen weights - they come from
+        the HuggingFace/torch hub checkpoint anyway.
+        """
+        state_dict = dict(state_dict)
+        backbones = (
+            ("model.transformer.backbone.", getattr(self.model.transformer, "backbone", None)),
+            ("model.visual.backbone.", getattr(self.model.visual, "backbone", None)),
+        )
+        own = None
+        for prefix, backbone in backbones:
+            if backbone is None:
+                state_dict = {k: v for k, v in state_dict.items() if not k.startswith(prefix)}
+            elif not any(k.startswith(prefix) for k in state_dict):
+                if own is None:
+                    own = self.state_dict()
+                state_dict.update({k: v for k, v in own.items() if k.startswith(prefix)})
+        return super().load_state_dict(state_dict, strict=strict)
 
     def tokenize(self, texts: List[str]) -> Dict[str, torch.Tensor]:
         tokens = self.tokenizer(
@@ -212,21 +251,24 @@ class CLIPLightningModule(pl.LightningModule):
 
         # ---- embeddings, computed once at full width and re-sliced for every MRL prefix ----
         emb: Dict[str, torch.Tensor] = {}
-        if h.w_global > 0 and ("global_emb" in batch or "global_tokens" in batch):
+        if ((h.w_global > 0 or h.w_translated_consistency > 0)
+                and ("global_emb" in batch or "global_tokens" in batch)):
             emb["global"] = self.text_group(batch, "global_emb", "global_tokens")
+        if (h.w_translated > 0 or h.w_translated_consistency > 0) and "translated_emb" in batch:
+            emb["translated"] = F.normalize(self.model.encode_text_emb(batch["translated_emb"]), dim=-1)
         if (h.w_dense_cap > 0 or h.w_dense_cap_cf > 0) and ("cap_emb" in batch or "cap_tokens" in batch):
             emb["cap"] = self.text_group(batch, "cap_emb", "cap_tokens")
         if h.w_dense_cap_cf > 0 and "cf_cap_emb" in batch and "cap_emb" in batch:
             emb["cf_cap"] = F.normalize(self.model.encode_text_emb(batch["cf_cap_emb"]), dim=-1)
         if h.w_dense > 0 and ("dense_emb" in batch or "dense_tokens" in batch):
             emb["dense"] = self.text_group(batch, "dense_emb", "dense_tokens")
-        if h.use_keywords and "kw_tokens" in batch:
-            emb["kw"] = self.enc_text(batch["kw_tokens"])
+        if h.use_keywords and ("kw_emb" in batch or "kw_tokens" in batch):
+            emb["kw"] = self.text_group(batch, "kw_emb", "kw_tokens")
         region_txt = region_valid = region_pos = None
         if use_regions:
             r_emb, visible = self._region_embeddings(patches, batch["region_cov"])
             emb["region"] = r_emb
-            region_txt = self.enc_text(batch["region_tokens"])
+            region_txt = self.text_group(batch, "region_emb", "region_tokens")
             # a region is a valid query only if it is visible in the crop and has a text target
             region_valid = visible & (batch["region_txt"] >= 0)
             region_pos = (F.one_hot(batch["region_txt"][region_valid], region_txt.shape[0]).bool()
@@ -252,7 +294,7 @@ class CLIPLightningModule(pl.LightningModule):
             # Matryoshka prefix: keep the first d dims and re-normalise (identity at full width)
             return x if d >= x.shape[-1] else F.normalize(x[..., :d], dim=-1)
 
-        def loss_at(d: int) -> Dict[str, torch.Tensor]:
+        def loss_at(d: int, is_full: bool) -> Dict[str, torch.Tensor]:
             se = {k: sl(v, d) for k, v in emb.items()}
             i = sl(img, d)
             out: Dict[str, torch.Tensor] = {}
@@ -260,8 +302,25 @@ class CLIPLightningModule(pl.LightningModule):
             pg: List[Tuple[torch.Tensor, torch.Tensor]] = []  # (text, pos) fed to the silhouette loss
 
             # 1) GCL: global contrastive loss (summary caption <-> image CLS)
-            if "global" in se:
+            if "global" in se and h.w_global > 0:
                 out["global"] = self.pair_loss(self.model.logits(i, se["global"]), eye)
+
+            # 1b) multilingual GCL: translated summary <-> image CLS. Only the rows that actually
+            # have a translation are positives (translated_img maps each translation to its image);
+            # images without one still act as negatives, and translations of other images are
+            # negatives too, so this stays a normal in-batch contrastive loss.
+            # 1c) cross-lingual consistency: each translated summary should match its English
+            # source; averaged over translations so the scale does not depend on coverage.
+            if "translated" in se:
+                tr = se["translated"]
+                tr_img = batch["translated_img"].to(dev)
+                if h.w_translated > 0:
+                    pos = torch.zeros(B, tr.shape[0], dtype=torch.bool, device=dev)
+                    pos[tr_img, torch.arange(tr.shape[0], device=dev)] = True
+                    out["translated"] = self.pair_loss(self.model.logits(i, tr), pos)
+                if "global" in se and h.w_translated_consistency > 0:
+                    out["translated_consistency"] = self.consistency_loss(
+                        se["global"][tr_img], tr)
 
             # 2a) whole dense caption <-> image (GCL over the full caption)
             if "cap" in se and h.w_dense_cap > 0:
@@ -304,21 +363,22 @@ class CLIPLightningModule(pl.LightningModule):
                 rt = sl(region_txt, d)
                 out["region"] = self.pair_loss(self.model.logits(se["region"][region_valid], rt), region_pos)
 
-            # 5) uniformity (images and texts averaged)
-            if h.w_uniform > 0:
+            # 5) uniformity (images and texts averaged). Geometry terms are full-width only:
+            # running them for every Matryoshka prefix repeats O(N^2) work with little benefit.
+            if is_full and h.w_uniform > 0:
                 u = self.uniform_loss(i)
                 if uni:
                     u = 0.5 * (u + self.uniform_loss(torch.cat(uni, 0)))
                 out["uniform"] = u
 
             # 6) silhouette (image CLS + positive texts, clustered per image)
-            if h.w_silhouette > 0:
+            if is_full and h.w_silhouette > 0:
                 z, lab = self._positive_points(i, pg)
                 if z is not None:
                     out["silhouette"] = self.silhouette_loss(z, lab)
 
             # 7) relational: match the pre-/post-projector pairwise structure (image + text)
-            if h.w_relational > 0:
+            if is_full and h.w_relational > 0:
                 rel = None
                 if pre_img is not None:
                     rel = self.relational_loss(pre_img, i)
@@ -333,7 +393,9 @@ class CLIPLightningModule(pl.LightningModule):
             return out
 
         weights = {
-            "global": h.w_global, "dense_cap": h.w_dense_cap, "dense_cap_cf": h.w_dense_cap_cf,
+            "global": h.w_global, "translated": h.w_translated,
+            "translated_consistency": h.w_translated_consistency,
+            "dense_cap": h.w_dense_cap, "dense_cap_cf": h.w_dense_cap_cf,
             "dense": h.w_dense, "dense_counter": h.w_counter, "dense_threshold": h.w_threshold,
             "kw_counter": h.w_counter, "kw_threshold": h.w_threshold,
             "region": h.w_region, "uniform": h.w_uniform, "silhouette": h.w_silhouette,
@@ -346,9 +408,12 @@ class CLIPLightningModule(pl.LightningModule):
         total = torch.zeros((), device=dev)
         flat: Dict[str, torch.Tensor] = {}
         for d in dims:
-            for name, value in loss_at(d).items():
+            is_full = d >= full_dim
+            for name, value in loss_at(d, is_full).items():
                 total = total + weights[name] * value
                 flat[f"{name}_d{d}" if mrl else name] = value
+        if not total.requires_grad:
+            total = total + self._zero_loss()
         return total, flat
 
     def common_step(self, batch, batch_idx) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -368,9 +433,23 @@ class CLIPLightningModule(pl.LightningModule):
     
 
     def _zero_loss(self) -> torch.Tensor:
-        """Graph-connected 0 so a skipped batch still runs backward + DDP all-reduce (avoids hangs)."""
-        p = next((p for p in self.model.parameters() if p.requires_grad), None)
-        return p.sum() * 0.0 if p is not None else torch.zeros((), device=self.device)
+        """Graph-connected 0 so a skipped batch still runs a full backward pass on every rank."""
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        if not params:
+            return torch.zeros((), device=self.device)
+        return sum(p.sum() for p in params) * 0.0
+
+    def on_after_backward(self):
+        """Surface trainable parameters that did not participate in this step (DDP raises later)."""
+        missing = [
+            name
+            for name, p in self.model.named_parameters()
+            if p.requires_grad and p.grad is None
+        ]
+        if missing:
+            warnings.warn(
+                "trainable parameters received no gradient in this step: " + ", ".join(missing)
+            )
 
     def _shared_step(self, batch, batch_idx, stage: str):
         total, losses = self.common_step(batch, batch_idx)
@@ -434,7 +513,12 @@ class CLIPLightningModule(pl.LightningModule):
 class MyLightningCLI(LightningCLI):
     def add_arguments_to_parser(self, parser):
         parser.add_argument("--watchmodel", action="store_true")
-        parser.add_argument("--ckpt_path", type=str, default=None, help="Path to checkpoint to resume from (e.g. last.ckpt or a specific .ckpt)")
+        parser.add_argument("--ckpt_path", type=str, default=None,
+                            help="Exact resume: restore weights, optimizer, scheduler, epoch and "
+                                 "global_step from this Lightning checkpoint (e.g. last.ckpt)")
+        parser.add_argument("--init_ckpt_path", type=str, default=None,
+                            help="Warm start: load only the model weights from this checkpoint and "
+                                 "start a fresh optimizer/scheduler/epoch (fine-tune from a ckpt)")
         # Weights & Biases tracking (see `use_wandb` in config.yaml)
         parser.add_argument("--use_wandb", action="store_true",
                             help="Log losses, metrics, GPU utilisation, lr and hparams to W&B")
@@ -457,6 +541,9 @@ class MyLightningCLI(LightningCLI):
         parser.link_arguments("model.use_hard_negatives", "data.use_hard_negatives")
         # a loss with weight 0 is switched off on the data side too (no tokenizing / negatives)
         parser.link_arguments("model.w_dense", "data.use_dense", compute_fn=lambda w: w > 0)
+        parser.link_arguments(
+            ("model.w_translated", "model.w_translated_consistency"), "data.use_translated",
+            compute_fn=lambda gcl, consistency: gcl > 0 or consistency > 0)
         parser.link_arguments("model.use_keywords", "data.use_keywords")
 
 
@@ -489,6 +576,8 @@ class MetricsCSVCallback(Callback):
         components = [
             n for n, on in (
                 ("global", hp.w_global > 0),
+                ("translated", hp.w_translated > 0 and hp.precomputed_text),
+                ("translated_consistency", hp.w_translated_consistency > 0 and hp.precomputed_text),
                 ("dense_cap", hp.w_dense_cap > 0),
                 ("dense_cap_cf", hp.w_dense_cap_cf > 0 and hp.precomputed_text),
                 ("dense", hp.w_dense > 0),
@@ -502,10 +591,14 @@ class MetricsCSVCallback(Callback):
                 ("relational", hp.w_relational > 0),
             ) if on
         ]
-        # Matryoshka: one column per (prefix width, component), matching the `_d<dim>` log keys
+        # Matryoshka: one column per (prefix width, component), matching the `_d<dim>` log keys.
+        # Geometry terms only run at full width, so they get a single `_d<full>` column.
         dims = CLIPLightningModule._mrl_dims(hp, hp.embed_dim)
         if getattr(hp, "use_mrl", False) and len(dims) > 1:
-            components = [f"{n}_d{d}" for d in dims for n in components]
+            full_only = {"uniform", "silhouette", "relational"}
+            per_dim = [n for n in components if n not in full_only]
+            components = ([f"{n}_d{d}" for d in dims for n in per_dim]
+                          + [f"{n}_d{dims[-1]}" for n in components if n in full_only])
         self._init_writer(log_dir, components)
 
     def on_validation_epoch_end(self, trainer, pl_module):
@@ -614,6 +707,34 @@ class SystemMetricsCallback(Callback):
                       on_step=False, on_epoch=True)
 
 
+def _config_get(config, key: str, default=None):
+    """Read a top-level CLI option from either a dict or a jsonargparse Namespace."""
+    if config is None:
+        return default
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _load_weights_into_model(model: torch.nn.Module, ckpt_path: str) -> None:
+    """Load model weights from a Lightning checkpoint (or a plain CLIP/state-dict file).
+
+    Only parameters are copied; optimizer / scheduler / loop state are intentionally not restored,
+    so this is a warm start rather than an exact resume.
+    """
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state = ckpt.get("state_dict", ckpt.get("model", ckpt)) if isinstance(ckpt, dict) else ckpt
+    if not isinstance(state, dict) or not state:
+        raise ValueError(f"{ckpt_path}: no model weights (state_dict) found in checkpoint")
+    state = {k[len("module."):] if k.startswith("module.") else k: v for k, v in state.items()}
+
+    if not any(k.startswith("model.") for k in state):
+        # a raw CLIP / CLIPLightningModule.model state dict uses the same keys without the leading
+        # "model." that Lightning wrappers add
+        state = {f"model.{k}": v for k, v in state.items()}
+    model.load_state_dict(state, strict=True)
+
+
 def cli_main(default_config_filename="./configs/default.yaml"):
     save_config_fn = default_config_filename.replace(".yaml", "-latest.yaml")
 
@@ -681,13 +802,19 @@ def cli_main(default_config_filename="./configs/default.yaml"):
     dir_log_cfg = Path(cli.trainer.log_dir) / dirname_cfg
     dir_log_cfg.mkdir(parents=True, exist_ok=True)
 
-    ckpt_path = None
-    # LightningCLI stores parsed args in config
-    if hasattr(cli, "config") and isinstance(cli.config, dict):
-        ckpt_path = cli.config.get("ckpt_path")
-    # Fallback to parser namespace if present
-    if ckpt_path is None and hasattr(cli, "trainer") and hasattr(cli.trainer, "default_root_dir"):
-        pass
+    ckpt_path = _config_get(cli.config, "ckpt_path") or None
+    init_ckpt_path = _config_get(cli.config, "init_ckpt_path") or None
+    if ckpt_path and init_ckpt_path:
+        raise ValueError("use either ckpt_path (exact resume) or init_ckpt_path (weights-only warm "
+                         "start), not both")
+    for label, path in (("ckpt_path", ckpt_path), ("init_ckpt_path", init_ckpt_path)):
+        if path is not None and not Path(path).is_file():
+            raise FileNotFoundError(f"{label}={path!r} does not exist (is it a checkpoint file?)")
+
+    if init_ckpt_path is not None:
+        _load_weights_into_model(cli.model, init_ckpt_path)
+        print(f"[checkpoint] warm-started model weights from {init_ckpt_path} "
+              f"(optimizer/scheduler/epoch reset)")
 
     cli.trainer.fit(
         model=cli.model,

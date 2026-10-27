@@ -1,7 +1,7 @@
 import os
 os.environ.setdefault('CUDA_VISIBLE_DEVICES', "1,2")
 
-from typing import Optional
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -221,25 +221,36 @@ class CounterfactualMarginLoss(nn.Module):
 
     def forward(self, img_emb: torch.Tensor, txt_emb: torch.Tensor,
                 pos: torch.Tensor, neg: torch.Tensor) -> torch.Tensor:
-        B = img_emb.shape[0]
         if txt_emb.shape[0] == 0:
             return _zero(img_emb)
         sim_im = img_emb @ txt_emb.t()          # (B, U)
         sim_tt = txt_emb @ txt_emb.t()          # (U, U)
-        terms = []
-        for i in range(B):
-            p = pos[i].nonzero(as_tuple=True)[0]
-            n = neg[i].nonzero(as_tuple=True)[0]
-            if p.numel() == 0 or n.numel() == 0:
-                continue
-            s_pos = sim_im[i, p]                 # (P,)
-            s_neg = sim_im[i, n]                 # (N,)
-            cross = sim_tt[p][:, n]              # (P, N) cosine between each a+ and a-
-            margin = self.margin * (1.0 - cross)    # 16-10 I am removing the tau_sim as it causes inconsistency
-            terms.append(F.softplus((s_neg.unsqueeze(0) - s_pos.unsqueeze(1) + margin) / self.tau))
+
+        n_pos = pos.sum(1)
+        n_neg = neg.sum(1)
+        valid = (n_pos > 0) & (n_neg > 0)
+        if not bool(valid.any()):
+            return _zero(img_emb)
+
+        # Group images by (num positives, num negatives) so every group is a dense tensor:
+        # no per-image Python loop and no nonzero() calls for each row.
+        terms: List[torch.Tensor] = []
+        counts = torch.stack([n_pos[valid], n_neg[valid]], dim=1)
+        for p_count, n_count in torch.unique(counts, dim=0).tolist():
+            rows = (valid & (n_pos == p_count) & (n_neg == n_count)).nonzero(as_tuple=True)[0]
+            p_cols = pos[rows].nonzero(as_tuple=True)[1].view(rows.numel(), p_count)  # (R, P)
+            n_cols = neg[rows].nonzero(as_tuple=True)[1].view(rows.numel(), n_count)  # (R, N)
+
+            s_pos = sim_im[rows[:, None], p_cols]                          # (R, P)
+            s_neg = sim_im[rows[:, None], n_cols]                          # (R, N)
+            cross = sim_tt[p_cols[:, :, None], n_cols[:, None, :]]         # (R, P, N)
+            margin = self.margin * (1.0 - cross)
+            terms.append(F.softplus(
+                (s_neg[:, None, :] - s_pos[:, :, None] + margin) / self.tau).reshape(-1))
+
         if not terms:
             return _zero(img_emb)
-        return torch.cat([t.flatten() for t in terms]).mean()
+        return torch.cat(terms).mean()
 
 
 class ThresholdLoss(nn.Module):
@@ -280,10 +291,14 @@ class UniformityLoss(nn.Module):
         n = z.shape[0]
         if n < 2:
             return _zero(z)
-        d2 = torch.cdist(z, z).pow(2)
+        # squared euclidean distances from one matmul instead of cdist (same values, faster and
+        # it avoids cdist's extra allocation). Unit vectors make this simply 2 - 2 <z_i, z_j>.
+        z2 = z.pow(2).sum(-1)
+        d2 = (z2[:, None] + z2[None, :] - 2.0 * (z @ z.t())).clamp_min_(0.0)
         eye = torch.eye(n, dtype=torch.bool, device=z.device)
-        vals = (-2.0 * d2)[~eye]
-        return torch.logsumexp(vals, dim=0) - torch.log(torch.tensor(vals.numel(), dtype=z.dtype, device=z.device))
+        vals = (-2.0 * d2).masked_fill(eye, float("-inf"))
+        return torch.logsumexp(vals.reshape(-1), dim=0) - torch.log(
+            torch.tensor(n * (n - 1), dtype=z.dtype, device=z.device))
 
 
 class SilhouetteLoss(nn.Module):
@@ -301,7 +316,13 @@ class SilhouetteLoss(nn.Module):
             return _zero(z)
         labels = labels.to(torch.long)
         C = int(labels.max().item()) + 1
-        D = torch.cdist(z, z)
+        # euclidean distances via one matmul (cdist is slower); sqrt keeps the true silhouette
+        z2 = z.pow(2).sum(-1)
+        d2 = (z2[:, None] + z2[None, :] - 2.0 * (z @ z.t())).clamp_min_(0.0)
+        # d2 is exactly zero on the diagonal; sqrt'(0) is infinite, which turns the
+        # otherwise-finite loss into NaN gradients. The epsilon is negligible versus the
+        # off-diagonal distances but keeps the diagonal gradient finite.
+        D = d2.clamp_min(1e-8).sqrt()
         M = F.one_hot(labels, C).to(z.dtype)         # (N, C) one-hot
         counts = M.sum(0)                            # (C,)
         sums = D @ M                                 # (N, C) sum of distances to each cluster
@@ -360,3 +381,18 @@ class RelationalLoss(nn.Module):
             diff = (pre * pre[idx]).sum(-1) - (post * post[idx]).sum(-1)
 
         return (diff * diff).mean() if self.squared else diff.mean()
+
+
+class CrossLingualConsistencyLoss(nn.Module):
+    r"""Pull the translated summary toward its English counterpart.
+
+    ``(1 / T) * sum_t [1 - cos(english_t, translated_t)]`` over the rows that have a
+    translation. The mean keeps the scale independent of how many translations happen to be in
+    the batch (T varies with the ~30% translation coverage), while ``_zero`` keeps DDP happy when
+    a batch contains none.
+    """
+
+    def forward(self, english_emb: torch.Tensor, translated_emb: torch.Tensor) -> torch.Tensor:
+        if translated_emb.shape[0] == 0:
+            return _zero(english_emb)
+        return (1.0 - F.cosine_similarity(english_emb, translated_emb, dim=-1)).mean()

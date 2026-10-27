@@ -20,13 +20,13 @@ Usage:
         --batch_size 256
 
 Point ``data.data_dir`` at a directory containing training parquet(s) only; do not mix the test
-split in here. Precomputed features use the same deterministic centre crop for every image, so
-random crop / flip augmentation is no longer applied during training.
+split in here. Precomputed features use the same deterministic resize as the pretraining DINOv2
+extraction, so random crop / flip augmentation is no longer applied during training.
 """
 from __future__ import annotations
 
 import os
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "3")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1,2")
 
 import argparse
 import io

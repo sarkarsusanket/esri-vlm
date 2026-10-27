@@ -19,7 +19,7 @@ wandb_offline: false
 wandb_every_n_steps: 50
 
 model:
-  ckpt_path: /home/susanket/esri-vlm/esri-vlm/so2wt9zp/checkpoints/epoch=6-step=41349.ckpt                 # REQUIRED: path to a pretraining checkpoint (.ckpt)
+  ckpt_path: /home/susanket/esri-vlm/esri-vlm/5knxzzqp/checkpoints/epoch=32-step=194931.ckpt                 # REQUIRED: path to a pretraining checkpoint (.ckpt)
   # Frozen-tower fast path: run `python sft/precompute.py ...` once, then point this at its output.
   # Only the two linear projections (+ logit scale/bias) are trained; no DINO/Qwen forward.
   precomputed_features: null      # e.g. /data/susanket/vlm/sft_features
@@ -35,12 +35,12 @@ model:
 
 data:
   data_dir: /data/susanket/vlm/sft/ # REQUIRED: directory containing *.parquet (image + caption)
-  precomputed_dir: null           # auto-filled from model.precomputed_features
+  precomputed_dir: /data/susanket/vlm/sft_feat/           # auto-filled from model.precomputed_features
   image_col: image_bytes          # column with encoded image bytes
   caption_col: caption               # null -> auto-detect (caption/summary/dense_caption/...)
   image_path_col: null            # set (with image_root) to read images from disk instead of bytes
   image_root: null
-  batch_size: 4096               # precomputed mode: pure linear probes, H100 handles this easily
+  batch_size: 1024               # precomputed mode: pure linear probes, H100 handles this easily
   num_workers: 8                 # only used by the online (non-precomputed) path
   val_fraction: 0.05
   split_seed: 0

@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import AutoModel
+from transformers import AutoConfig, AutoModel
 
 
 class Bottleneck(nn.Module):
@@ -613,33 +613,48 @@ class QwenTextTower(nn.Module):
 
     def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B", embed_dim: int = 512,
                  context_length: int = 256, pooling: str = "last_eos", freeze: bool = True,
-                 pad_token_id: Optional[int] = None, cache_size: int = 50000):
+                 pad_token_id: Optional[int] = None, cache_size: int = 50000,
+                 load_backbone: bool = True):
         super().__init__()
-        self.backbone = AutoModel.from_pretrained(model_name)
+        self.load_backbone = load_backbone
+        if load_backbone:
+            self.backbone = AutoModel.from_pretrained(model_name)
+            self.hidden_dim = int(self.backbone.config.hidden_size)
+        else:
+            if not freeze:
+                raise ValueError("load_backbone=False requires freeze=True "
+                                 "(there is no text backbone to fine-tune)")
+            self.backbone = None
+            # only the config is needed: precomputed EOS states are (N, hidden_dim) and the
+            # trainable projection maps them into the shared space
+            self.hidden_dim = int(AutoConfig.from_pretrained(model_name).hidden_size)
         self.freeze = freeze
-        self.hidden_dim = int(self.backbone.config.hidden_size)
         self.context_length = context_length
         self.pooling = pooling
         self.pad_token_id = pad_token_id
-        # LRU cache of pooled EOS states for repeated texts (keyword groups are re-encoded every
-        # step but come from a bounded vocabulary). Only the FROZEN backbone output is cached, so
-        # the trainable projection is re-applied each step and never goes stale.
+        # LRU cache of pooled EOS states for repeated on-the-fly texts. Only the FROZEN backbone
+        # output is cached, so the trainable projection is re-applied each step and never stale.
         self.cache_size = int(cache_size)
         self._pooled_cache: "OrderedDict[tuple, torch.Tensor]" = OrderedDict()
 
         self.proj = nn.Linear(self.hidden_dim, embed_dim, bias=False)
         nn.init.normal_(self.proj.weight, std=0.02)
 
-        if freeze:
+        if freeze and self.backbone is not None:
             for p in self.backbone.parameters():
                 p.requires_grad_(False)
             self.backbone.eval()
 
     def train(self, mode: bool = True):
         super().train(mode)
-        if self.freeze:
+        if self.freeze and self.backbone is not None:
             self.backbone.eval()
         return self
+
+    def _require_backbone(self) -> None:
+        if self.backbone is None:
+            raise RuntimeError("this QwenTextTower was built with load_backbone=False; tokenized "
+                               "text encoding is unavailable (all text must be precomputed)")
 
     def _key(self, ids: list) -> tuple:
         # drop padding so the same text hits the cache regardless of how it was padded in a batch
@@ -649,6 +664,7 @@ class QwenTextTower(nn.Module):
 
     def _pooled(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """Pooled EOS states for the batch, backed by an LRU cache when the backbone is frozen."""
+        self._require_backbone()
         if self.cache_size <= 0 or not self.freeze:
             hidden = self.backbone(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
             if self.freeze:
@@ -689,10 +705,9 @@ class QwenTextTower(nn.Module):
     def forward_emb(self, pooled: torch.Tensor) -> torch.Tensor:
         """Project a precomputed pooled (EOS) hidden state, skipping the backbone.
 
-        Used for the summary / dense-caption / counterfactual embeddings written by
-        ``preprocess/precompute_eos.py`` (raw last-layer EOS states, (N, hidden_dim)); only the
-        trainable linear projection runs. Keyword texts are still tokenised and go through
-        ``forward``, so the Qwen backbone must stay loaded (and frozen) in this mode.
+        Used for the summary / dense-caption / counterfactual / keyword / region embeddings
+        written by ``preprocess/precompute_eos.py`` and ``preprocess/precompute_keyword.py``
+        (raw last-layer EOS states, (N, hidden_dim)); only the trainable linear projection runs.
         """
         if pooled.ndim != 2 or pooled.shape[-1] != self.hidden_dim:
             raise ValueError(f"precomputed text embeddings must have shape (N, {self.hidden_dim}), "
@@ -718,9 +733,9 @@ class CLIP(nn.Module):
 
     With ``precomputed_image`` / ``precomputed_text`` the matching backbone is replaced by its
     precomputed outputs (DINOv2 tokens from ``generate_dino_emb.py`` / ``precompute_cls.py``,
-    Qwen EOS states from ``precompute_eos.py``) and only the projections run. The text backbone
-    itself is still loaded in ``precomputed_text`` mode because keyword / region groups remain
-    tokenised and encoded on the fly.
+    Qwen EOS states from ``precompute_eos.py`` / ``precompute_keyword.py``) and only the
+    projections run. In ``precomputed_text`` mode keyword combinations are sums of the individual
+    keyword EOS states, so the Qwen backbone is not needed at all.
     """
 
     def __init__(
@@ -735,6 +750,7 @@ class CLIP(nn.Module):
         freeze_image_tower: bool = True,
         precomputed_image: bool = False,
         precomputed_text: bool = False,
+        load_text_backbone: bool = True,
         pad_token_id: Optional[int] = None,
         text_cache_size: int = 50000,
         # logit scale / bias (SigLIP uses scale=log(10) and a learnable bias=-10)
@@ -764,6 +780,7 @@ class CLIP(nn.Module):
             freeze=freeze_text_tower,
             pad_token_id=pad_token_id,
             cache_size=text_cache_size,
+            load_backbone=load_text_backbone,
         )
 
         self.logit_scale = nn.Parameter(torch.ones([]) * logit_scale_init)

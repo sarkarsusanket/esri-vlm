@@ -8,6 +8,8 @@ Layout (xx = shard id)::
     caption-xx.parquet        file_name, summary, dense_caption, key_elements,
                               cf_dense_caption (negated dense paragraph, see generate_cf.py)
     caption-xx/summary/<file_name>.npy          precomputed Qwen EOS embedding, (1, H) fp16
+    caption-xx/translated_col/<file_name>.npy    optional foreign-language summary embedding,
+                                                (1, H) fp16; only ~30% of the rows have one
     caption-xx/dense_caption/<file_name>.npy    row 0 = whole paragraph, rows 1..S = sentences,
                                                 (1 + S, H) fp16 (see preprocess/precompute_eos.py)
     caption-xx/cf_dense_caption/<file_name>.npy same layout; sentence j negates dense sentence j
@@ -27,13 +29,14 @@ reads ONLY the DINOv2 CLS token from ``cls-xx.npy`` (N, D) + ``cls-xx.names.txt`
 ``precompute_cls.py``, instead of opening a (1 + P, D) ``.npy`` per sample. ``image_emb`` is then (D,).
 
 ``precomputed_text=True`` makes samples carry precomputed Qwen text embeddings instead of raw
-caption strings: ``summary_emb`` (H,), and when dense captions are enabled ``cap_emb`` (H, the
+caption strings: ``summary_emb`` (H,), ``translated_emb`` (H,) for the ~30% of records that have a
+foreign-language summary, and when dense captions are enabled ``cap_emb`` (H, the
 whole paragraph), ``cf_cap_emb`` (H, the whole counterfactual paragraph), ``dense_emb`` (K, H) the
 selected sentence rows and ``hard_neg_emb`` (M, H) the counterfactual rows of
 ``cf_dense_caption`` (negatives are never mutated on the fly in this mode; ``cf`` rows that are not
 precomputed yet simply yield neither ``cf_cap_emb`` nor a negative). Records without a
-``summary/<stem>.npy`` are skipped. Keyword / region texts are NOT precomputed: they stay strings
-and are tokenised by the collator.
+``summary/<stem>.npy`` are skipped. Keyword / region strings stay in the samples; the collator
+turns them into precomputed EOS sums when a ``keyword_eos/`` lookup is configured.
 """
 from __future__ import annotations
 
@@ -61,6 +64,10 @@ STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 # columns of preprocess/precompute_eos.py (only `summary` is required for a record to be usable,
 # it feeds the global loss; dense/cf embeddings are optional per record)
 TEXT_EMB_COLS = ("summary", "dense_caption", "cf_dense_caption")
+# optional extra text states that not every record / shard has (only ~30% of the captions have a
+# translated summary, and later shards may not have the directory at all). Missing files simply
+# mean the record has no translation, so they must not skip the sample or warn.
+OPTIONAL_TEXT_EMB_COLS = ("translated_col",)
 
 
 class SkipSample(Exception):
@@ -168,6 +175,10 @@ class ShardIndex:
                         text_stems[col] = set()
                         warnings.warn(f"{d.relative_to(self.root)}/ missing: shard {name} has no "
                                       f"precomputed '{col}' embeddings (run preprocess/precompute_eos.py)")
+                for col in OPTIONAL_TEXT_EMB_COLS:
+                    d = cap_dir / col
+                    text_stems[col] = ({e.stem for e in d.iterdir() if e.suffix == ".npy"}
+                                       if d.is_dir() else set())
 
             mask_map: Dict[str, Tuple[str, ...]] = {}
             if use_masks:
@@ -360,6 +371,9 @@ class SampleConfig:
     hflip_prob: float = 0.0
     use_dense: bool = True
     dense_max_sentences: int = 8
+    # optional translated summary embeddings (`caption-xx/translated_col/`); only ~30% of the
+    # records have one, so they are loaded per record and never required
+    use_translated: bool = True
     # with precomputed_text the negatives are the precomputed cf_dense_caption sentences
     # (hard_neg_per_image still caps them; mut_count / hardness only affect the rule-based
     # on-the-fly mutation used when text embeddings are NOT precomputed)
@@ -369,7 +383,8 @@ class SampleConfig:
     hard_neg_hardness: float = 0.5
     use_keywords: bool = True
     # keyword groups: random positive combinations, absent-keyword negatives and swapped-keyword
-    # hard negatives are built across the batch inside ClipCollator (see data.py)
+    # hard negatives are built across the batch inside ClipCollator (see data.py); with a
+    # precomputed keyword lookup each combination is the sum of its individual keyword EOS states
     keyword_subsets: int = 4        # positive combos sampled per image
     keyword_negs: int = 4           # absent single keywords used as negatives per image
     keyword_hard_negs: int = 3      # hard negatives (positive combo with swapped keywords) per image
@@ -408,6 +423,17 @@ class SampleBuilder:
             raise SkipSample(f"{rec.file_name}: no precomputed summary embedding")
         summary_emb = np.asarray(summ[0], dtype=np.float32)
         out["summary_emb"] = summary_emb
+
+        # Translated summary (foreign-language EOS state). Optional: only some records have one,
+        # so a missing file/column just means this row carries no multilingual pair.
+        if cfg.use_translated:
+            tr = self.index.text_emb(rec, "translated_col")
+            if tr is not None and tr.shape[0] > 0:
+                if tr.shape[-1] != summary_emb.shape[-1]:
+                    raise SkipSample(f"{rec.file_name}: translated_col embedding has dim "
+                                     f"{tr.shape[-1]}, summary has {summary_emb.shape[-1]}")
+                out["translated_emb"] = np.asarray(tr[0], dtype=np.float32)
+
         if not cfg.use_dense:
             return
 

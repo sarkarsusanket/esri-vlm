@@ -58,11 +58,18 @@ def decode_group(collator, tokens) -> list:
             for j in range(ids.shape[0])]
 
 
-def fmt_tensor(t: torch.Tensor) -> str:
-    if t.dtype == torch.bool:
+def fmt_tensor(t) -> str:
+    if hasattr(t, "is_floating_point"):
+        if t.dtype == torch.bool:
+            return f"bool sum={int(t.sum())}"
+        if t.is_floating_point():
+            return f"{t.dtype} min={t.min().item():.3f} max={t.max().item():.3f} mean={t.mean().item():.3f}"
+        return f"{t.dtype}"
+    t = np.asarray(t)
+    if t.dtype == np.bool_:
         return f"bool sum={int(t.sum())}"
-    if t.is_floating_point():
-        return f"{t.dtype} min={t.min().item():.3f} max={t.max().item():.3f} mean={t.mean().item():.3f}"
+    if np.issubdtype(t.dtype, np.floating):
+        return f"{t.dtype} min={t.min():.3f} max={t.max():.3f} mean={t.mean():.3f}"
     return f"{t.dtype}"
 
 
@@ -90,7 +97,8 @@ def datamodule_kwargs(cfg: dict, args) -> dict:
         precomputed_text=m.get("precomputed_text", False),
         use_masks=args.use_masks if args.use_masks is not None else m.get("use_masks", False),
         use_dense=m.get("w_dense", 1.0) > 0,
-        use_keywords=m.get("use_keywords", True),
+        use_keywords=(args.use_keywords if args.use_keywords is not None
+                      else m.get("use_keywords", True)),
         use_hard_negatives=m.get("use_hard_negatives", True),
         dense_max_sentences=d.get("dense_max_sentences", 8),
         hard_neg_per_image=d.get("hard_neg_per_image", 3),
@@ -103,6 +111,7 @@ def datamodule_kwargs(cfg: dict, args) -> dict:
         mask_subdir=d.get("mask_subdir", "masks"),
         max_regions_per_image=d.get("max_regions_per_image", 8),
         region_template=d.get("region_template", "{}"),
+        keyword_emb_dir=d.get("keyword_emb_dir"),
         crop_scale=tuple(d.get("crop_scale", (0.5, 1.0))),
         hflip_prob=d.get("hflip_prob", 0.0),
         row_group_cache=d.get("row_group_cache", 4),
@@ -230,18 +239,34 @@ def show_batch(collator, samples) -> None:
             if negs:
                 tag.append(f"- {negs}")
             print(f"    [{u}] {'  '.join(tag):38s} {txt}")
+    elif "kw_emb" in batch:
+        pos, neg = batch["kw_pos"], batch["kw_neg"]
+        print(f"\n  keywords ({batch['kw_emb'].shape[0]} unique summed-EOS columns; "
+              f"+ positive / - negative per image)")
+        for u in range(batch["kw_emb"].shape[0]):
+            owners = [i for i in range(B) if bool(pos[i, u])]
+            negs = [i for i in range(B) if bool(neg[i, u])]
+            tag = []
+            if owners:
+                tag.append(f"+ {owners}")
+            if negs:
+                tag.append(f"- {negs}")
+            print(f"    [{u}] {'  '.join(tag)}")
 
-    if "region_tokens" in batch:
-        texts = decode_group(collator, batch["region_tokens"])
+    if "region_tokens" in batch or "region_emb" in batch:
+        texts = (decode_group(collator, batch["region_tokens"])
+                 if "region_tokens" in batch else None)
         cov, txt = batch["region_cov"], batch["region_txt"]
-        print(f"\n  regions ({len(texts)} unique keyword(s); grid {cov.shape[-1]}x{cov.shape[-1]})")
+        n_unique = len(texts) if texts is not None else batch["region_emb"].shape[0]
+        print(f"\n  regions ({n_unique} unique keyword(s); grid {cov.shape[-1]}x{cov.shape[-1]})")
         for i in range(B):
             for k in range(txt.shape[1]):
                 t = int(txt[i, k])
                 if t < 0:
                     continue
                 c = cov[i, k]
-                print(f"    image {i}  @{k}  '{texts[t]}'  coverage mean={c.mean():.3f} "
+                label = repr(texts[t]) if texts is not None else f"emb[{t}]"
+                print(f"    image {i}  @{k}  {label}  coverage mean={c.mean():.3f} "
                       f"cells={int((c > 0).sum())}/{c.numel()}")
 
 
@@ -257,6 +282,10 @@ def main() -> None:
                     help="force regions on")
     ap.add_argument("--no-masks", dest="use_masks", action="store_false",
                     help="force regions off")
+    ap.add_argument("--use-keywords", dest="use_keywords", action="store_true", default=None,
+                    help="force keyword groups on")
+    ap.add_argument("--no-keywords", dest="use_keywords", action="store_false",
+                    help="force keyword groups off")
     ap.add_argument("--no-image", dest="show_image", action="store_false", default=True,
                     help="skip the ASCII image preview")
     args = ap.parse_args()
@@ -269,7 +298,7 @@ def main() -> None:
     hr(f"config {args.config}")
     for key in ("data_dir", "image_resolution", "patch_size", "context_length", "precomputed_image",
                 "precomputed_text", "use_masks", "use_dense", "use_keywords", "use_hard_negatives",
-                "batch_size"):
+                "keyword_emb_dir", "batch_size"):
         print(f"  {key:20s} {kw[key]}")
 
     print("\nbuilding index / tokenizer ... (this scans the caption shards)")

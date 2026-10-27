@@ -43,7 +43,7 @@ trainer:
   enable_autolog_hparams: true
   model_registry: null
 model:
-  ckpt_path: /home/susanket/esri-vlm/esri-vlm/so2wt9zp/checkpoints/epoch=6-step=41349.ckpt
+  ckpt_path: /home/susanket/esri-vlm/esri-vlm/5knxzzqp/checkpoints/epoch=32-step=194931.ckpt
   image_resolution: null
   context_length: null
   loss_type: siglip
@@ -56,6 +56,7 @@ model:
   min_lr_ratio: 0.0
   gather_across_gpus: false
   w_relational: 0.1
+  precomputed_features: /data/susanket/vlm/sft_feat/
 data:
   data_dir: /data/susanket/vlm/sft/
   image_col: image_bytes
@@ -72,6 +73,7 @@ data:
   hflip_prob: 0.0
   row_group_cache: 4
   drop_last: true
+  precomputed_dir: /data/susanket/vlm/sft_feat/
   image_resolution: 224
   context_length: 256
   tokenizer_name: Qwen/Qwen3-Embedding-0.6B

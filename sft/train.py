@@ -11,8 +11,9 @@ the checkpoint.
 from __future__ import annotations
 
 import os
-os.environ.setdefault('CUDA_VISIBLE_DEVICES', "3")
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', "1,2")
 
+import math
 import sys
 import time
 from datetime import datetime
@@ -29,6 +30,8 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from torch import nn  # noqa: E402
+
+torch.set_float32_matmul_precision("high")
 import lightning.pytorch as pl  # noqa: E402
 from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelCheckpoint  # noqa: E402
 from lightning.pytorch.cli import LightningCLI  # noqa: E402
@@ -122,11 +125,11 @@ class SFTModel(pl.LightningModule):
             self.image_proj.weight.copy_(img_w)
             self.text_proj.weight.copy_(txt_w)
 
-        self.logit_scale = nn.Parameter(state["logit_scale"].float().reshape(()).clone())
+        self._logit_scale = nn.Parameter(state["logit_scale"].float().reshape(()).clone())
         if state.get("logit_bias") is not None:
-            self.logit_bias = nn.Parameter(state["logit_bias"].float().reshape(()).clone())
+            self._logit_bias = nn.Parameter(state["logit_bias"].float().reshape(()).clone())
         else:
-            self.register_parameter("logit_bias", None)
+            self.register_parameter("_logit_bias", None)
 
         root = Path(features_dir)
         img = np.load(root / "image.npy", mmap_mode="r")
@@ -148,6 +151,15 @@ class SFTModel(pl.LightningModule):
               f"image_dim={img.shape[1]} text_dim={txt.shape[1]}, backbones not loaded")
 
     # ------------------------------------------------------------------ forward pieces
+    @property
+    def logit_scale(self) -> torch.Tensor:
+        """The trainable logit scale, whether it lives on the wrapper or on the CLIP module."""
+        return self.model.logit_scale if self.model is not None else self._logit_scale
+
+    @property
+    def logit_bias(self) -> Optional[torch.Tensor]:
+        return self.model.logit_bias if self.model is not None else self._logit_bias
+
     def _logits(self, img: torch.Tensor, txt: torch.Tensor) -> torch.Tensor:
         if self.precomputed:
             logits = self.logit_scale.exp() * img @ txt.t()
@@ -201,7 +213,11 @@ class SFTModel(pl.LightningModule):
                  prog_bar=True, sync_dist=True)
         self.log(f"{stage}_acc", _retrieval_acc(logits, pos), on_epoch=True, on_step=False,
                  sync_dist=True)
-        self.log("logit_scale", self.logit_scale.exp(), on_step=False, on_epoch=True)
+        self.log("logit_scale", self.logit_scale.exp().detach(), on_step=False, on_epoch=True,
+                 sync_dist=True)
+        if self.logit_bias is not None:
+            self.log("logit_bias", self.logit_bias.detach(), on_step=False, on_epoch=True,
+                     sync_dist=True)
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -216,7 +232,7 @@ class SFTModel(pl.LightningModule):
         for name, p in self.named_parameters():
             if not p.requires_grad:
                 continue
-            if p.ndim == 1 or name.endswith(".bias"):
+            if p.ndim <= 1 or name.endswith(".bias"):
                 no_decay.append(p)
             else:
                 decay.append(p)
@@ -231,7 +247,7 @@ class SFTModel(pl.LightningModule):
             if step < warmup:
                 return step / warmup
             progress = (step - warmup) / max(1, total - warmup)
-            return max(self.hparams.min_lr_ratio, 0.5 * (1 + torch.cos(torch.tensor(progress * 3.141592653589793))).item())
+            return max(self.hparams.min_lr_ratio, 0.5 * (1 + math.cos(math.pi * progress)))
 
         return {"optimizer": opt,
                 "lr_scheduler": {"scheduler": torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda),
@@ -252,7 +268,8 @@ class SystemMetricsCallback(Callback):
         self._t0 = self._step_t0 = time.time()
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        self._samples += batch["images"].shape[0]
+        images = batch.get("images")
+        self._samples += int(images.shape[0]) if images is not None else int(batch["idx"].shape[0])
         if (batch_idx + 1) % self.every_n_steps:
             return
         now = time.time()
@@ -296,6 +313,17 @@ class SFTCLI(LightningCLI):
                             help="Comma-separated list of tags")
         parser.add_argument("--wandb_offline", action="store_true")
         parser.add_argument("--wandb_every_n_steps", type=int, default=50)
+
+    def before_instantiate_classes(self) -> None:
+        # `data.precomputed_dir` is a convenience alias for the real switch,
+        # `model.precomputed_features`. Resolve it *before* the model is built, otherwise the
+        # backbones are loaded and the datamodule silently falls back to decoding images.
+        data_cfg = self.config.get("data")
+        model_cfg = self.config.get("model")
+        if data_cfg is not None and model_cfg is not None:
+            data_pre = data_cfg.get("precomputed_dir")
+            if data_pre and not model_cfg.get("precomputed_features"):
+                model_cfg.precomputed_features = data_pre
 
 
 def cli_main(default_config: str) -> None:

@@ -1,0 +1,125 @@
+# lightning.pytorch==2.6.5
+seed_everything: 0
+trainer:
+  accelerator: auto
+  strategy: auto
+  devices: auto
+  num_nodes: 1
+  precision: bf16-mixed
+  logger: null
+  callbacks: null
+  fast_dev_run: false
+  max_epochs: 100
+  min_epochs: null
+  max_steps: -1
+  min_steps: null
+  max_time: null
+  limit_train_batches: null
+  limit_val_batches: null
+  limit_test_batches: null
+  limit_predict_batches: null
+  overfit_batches: 0.0
+  val_check_interval: null
+  check_val_every_n_epoch: 1
+  num_sanity_val_steps: null
+  log_every_n_steps: 10
+  enable_checkpointing: null
+  enable_progress_bar: null
+  enable_model_summary: null
+  accumulate_grad_batches: 1
+  gradient_clip_val: null
+  gradient_clip_algorithm: null
+  deterministic: null
+  benchmark: null
+  inference_mode: true
+  use_distributed_sampler: true
+  profiler: null
+  detect_anomaly: false
+  barebones: false
+  plugins: null
+  sync_batchnorm: false
+  reload_dataloaders_every_n_epochs: 0
+  default_root_dir: null
+  enable_autolog_hparams: true
+  model_registry: null
+model:
+  text_model_name: Qwen/Qwen3-Embedding-0.6B
+  image_model_name: dinov2_vits14
+  text_pooling: last_eos
+  freeze_text_tower: true
+  freeze_image_tower: true
+  precomputed_image: true
+  precomputed_text: true
+  load_text_backbone: null
+  embed_dim: 256
+  image_resolution: 224
+  vision_patch_size: 14
+  context_length: 256
+  learning_rate: 0.0005
+  weight_decay: 0.1
+  warmup_steps: 2000
+  loss_type: siglip
+  use_mrl: true
+  mrl_dims:
+  - 64
+  - 128
+  - 256
+  use_masks: true
+  use_hard_negatives: true
+  use_keywords: true
+  w_global: 1.0
+  w_translated: 0.8
+  w_translated_consistency: 0.5
+  w_dense: 1.0
+  w_dense_cap: 1.0
+  w_dense_cap_cf: 1.0
+  w_region: 1.0
+  w_counter: 1.0
+  counter_margin: 0.5
+  counter_tau: 0.1
+  w_threshold: 1.0
+  threshold_pos: 0.8
+  threshold_neg: 0.7
+  w_uniform: 0.8
+  w_silhouette: 0.5
+  w_relational: 0.8
+  relational_pairing: perm
+  relational_squared: false
+  region_min_coverage: 0.1
+  tokenizer_name: Qwen/Qwen3-Embedding-0.6B
+  text_cache_size: 50000
+data:
+  data_dir: /data/susanket/vlm/images3
+  image_col: image_bytes
+  batch_size: 1024
+  num_workers: 30
+  val_fraction: 0.1
+  split_seed: 0
+  dense_max_sentences: 5
+  hard_neg_per_image: 4
+  hard_neg_mut_count: 1
+  hard_neg_hardness: 0.5
+  keyword_subsets: 2
+  keyword_negs: 2
+  keyword_hard_negs: 1
+  keyword_hard_neg_swap: 1
+  mask_subdir: masks
+  max_regions_per_image: 8
+  region_template: '{}'
+  keyword_emb_dir: keyword_eos
+  crop_scale:
+  - 0.5
+  - 1.0
+  hflip_prob: 0.0
+  row_group_cache: 4
+watchmodel: false
+ckpt_path: null
+init_ckpt_path: null
+use_wandb: true
+wandb_project: esri-vlm
+wandb_entity: null
+wandb_tags: dinov2,qwen30.6,siglip,MRL,relationalloss,multilingual
+wandb_offline: false
+wandb_every_n_steps: 100
+optimizer: null
+lr_scheduler: null

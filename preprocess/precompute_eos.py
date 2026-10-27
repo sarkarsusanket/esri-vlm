@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import os
 if "CUDA_VISIBLE_DEVICES" not in os.environ:
-    os.environ["CUDA_VISIBLE_DEVICES"] = "1,2"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0,3"
 
 import argparse
 import logging
@@ -50,7 +50,7 @@ from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-ALL_COLS = ("summary", "dense_caption", "cf_dense_caption")
+ALL_COLS = ("summary", "dense_caption", "cf_dense_caption", "translated_col")
 PARAGRAPH_COLS = {"dense_caption", "cf_dense_caption"}
 # same splitter as cf_dense_caption_vllm.py so sentence i of the CF caption aligns with sentence i of the original
 _SENT_SPLIT = re.compile(r"((?<=[.!?])\s+)")
@@ -235,7 +235,7 @@ def run_worker(rank: int, world: int, gpu_ids: list[int], files: list[Path], roo
 
 def parse_args(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input_dir", required=True, help="Directory containing caption-XX.parquet files.")
+    ap.add_argument("--input_dir", default="/data/susanket/vlm/images3/", help="Directory containing caption-XX.parquet files.")
     ap.add_argument("--output_dir", default=None, help="Root for caption-XX/ dirs (default: next to each parquet).")
     ap.add_argument("--pattern", default="caption*.parquet")
     ap.add_argument("--columns", default=','.join(ALL_COLS),
@@ -252,7 +252,7 @@ def parse_args(argv=None):
     ap.add_argument("--chunk_rows", type=int, default=2048, help="Parquet rows embedded per step.")
     ap.add_argument("--save_threads", type=int, default=4)
     ap.add_argument("--max_pending_saves", type=int, default=256)
-    ap.add_argument("--gpus", default="0", help="Comma list of GPU ids; files are sharded across them.")
+    ap.add_argument("--gpus", default="0,1", help="Comma list of GPU ids; files are sharded across them.")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--limit_rows", type=int, default=0, help="Only first N rows per file (quick test).")
     a = ap.parse_args(argv)

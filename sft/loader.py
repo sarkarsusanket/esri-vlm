@@ -9,7 +9,7 @@ load everything else from the checkpoint with ``strict=False``.
 from __future__ import annotations
 
 import os
-os.environ.setdefault('CUDA_VISIBLE_DEVICES', "3")
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', "1,2")
 
 import sys
 import warnings

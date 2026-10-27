@@ -18,6 +18,8 @@ Usage:
         --georsclip_ckpt /data/susanket/vlm/sota/RS5M_ViT-B-32.pt \
         --batch_size 64
 """
+import os
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', "3")
 
 import argparse
 import io
@@ -418,7 +420,7 @@ tr:hover td {{ background:#f8fafc; }}
 def main():
     parser = argparse.ArgumentParser(description="Evaluate multiple SOTA Remote Sensing VLMs")
     parser.add_argument("--benchmark_root", type=str, default="/data/susanket/vlm/eval")
-    parser.add_argument("--models", nargs="+", default=["gitrsclip", "georsclip", "skyclip", "remoteclip"],
+    parser.add_argument("--models", nargs="+", default=["farslip"],
                         choices=["gitrsclip", "georsclip", "skyclip", "remoteclip", "farslip"])
     parser.add_argument("--georsclip_ckpt", type=str, default="/data/susanket/vlm/sota/RS5M_ViT-B-32.pt")
     parser.add_argument("--skyclip_ckpt", type=str, default="/data/susanket/vlm/sota/SkyCLIP-ViT-L-14.pth")
