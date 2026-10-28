@@ -2,7 +2,7 @@
 use_wandb: true
 wandb_project: "esri-vlm"
 wandb_entity: null            # set your W&B team/user if needed
-wandb_tags:  "dinov2,qwen30.6,siglip,MRL,relationalloss,multilingual"              # e.g. "mrl,dinov2,siglip"
+wandb_tags:  "dinov2,qwen30.6,siglip,MRL,relationalloss,multilingual,regionloss,keywordloss"              # e.g. "mrl,dinov2,siglip"
 wandb_offline: false          # true -> log locally, sync later with `wandb sync`
 wandb_every_n_steps: 100       # sampling cadence for GPU/CPU/RAM metrics
 
@@ -26,6 +26,14 @@ model:
                                         # regions use keyword_eos/ (summed individual keyword states)
   # ---- projected embedding space
   embed_dim: 256
+  projection_type: mlp  # linear_probe | mlp | transformer
+                                 # mlp: LayerNorm -> W_in -> residual W2 GELU(W1 h) -> LayerNorm
+                                 # transformer: LayerNorm -> W_in -> TransformerEncoder -> LayerNorm
+                                 # image and text heads have independent weights
+  projection_dropout: 0.0        # mlp / transformer
+  projection_num_layers: 1       # transformer only
+  projection_num_heads: 8        # transformer only; must divide embed_dim
+  projection_ff_dim: 1024        # transformer only; <=0 -> 4 * embed_dim
   image_resolution: 224        # also forwarded to the datamodule
   vision_patch_size: 14        # DINOv2 ViT-S/14 (mask grid = 224 / 14 = 16)
   context_length: 256
@@ -69,7 +77,7 @@ model:
   w_relational: 0.8            # (1/B) sum_i [cos_pre(i,j) - cos_post(i,j)] on precomputed
                                # image CLS + caption EOS states; 0 disables
   relational_pairing: perm     # how j is chosen: perm | shift | all
-  relational_squared: false    # true -> mean((cos_pre - cos_post)^2) (structure matching)
+  relational_squared: true    # true -> mean((cos_pre - cos_post)^2) (structure matching)
   region_min_coverage: 0.1     # a patch counts for a region if >= 10% of it is inside the mask
   text_cache_size: 50000       # LRU cache of frozen Qwen pooled states for repeated on-the-fly
                                # text; unused when precomputed_text=true; 0 disables

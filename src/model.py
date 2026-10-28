@@ -502,8 +502,100 @@ def pool_tokens(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor,
     raise ValueError(f"Unsupported pooling mode '{pooling_mode}'.")
 
 
+PROJECTION_TYPES = ("linear_probe", "mlp", "transformer")
+
+
+def _flatten_leading(x: torch.Tensor, fn):
+    """Apply a per-vector head while preserving arbitrary leading dimensions."""
+    shape = x.shape[:-1]
+    out = fn(x.reshape(-1, x.shape[-1]))
+    return out.reshape(*shape, out.shape[-1])
+
+
+class ResidualMLPProjection(nn.Module):
+    """LayerNorm -> linear -> residual MLP block -> LayerNorm.
+
+    The residual block lives in ``embed_dim`` space, matching the requested
+    ``z = h + W2 GELU(W1 h)`` (independent weights per tower).
+    """
+
+    def __init__(self, input_dim: int, embed_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.ln_in = nn.LayerNorm(input_dim)
+        self.in_proj = nn.Linear(input_dim, embed_dim, bias=False)
+        self.w1 = nn.Linear(embed_dim, embed_dim)
+        self.w2 = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.ln_out = nn.LayerNorm(embed_dim)
+        nn.init.normal_(self.in_proj.weight, std=0.02)
+
+    def _forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.in_proj(self.ln_in(x))
+        z = h + self.w2(self.dropout(F.gelu(self.w1(h))))
+        return self.ln_out(z)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _flatten_leading(x, self._forward)
+
+
+class TransformerProjection(nn.Module):
+    """LayerNorm -> linear -> a simple transformer encoder -> LayerNorm.
+
+    Each input vector is treated as a length-1 sequence. ``num_layers``/``num_heads``/
+    ``ff_dim``/``dropout`` are configurable; independent weights per tower.
+    """
+
+    def __init__(self, input_dim: int, embed_dim: int, num_layers: int = 1,
+                 num_heads: int = 8, ff_dim: int = 1024, dropout: float = 0.0):
+        super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError(f"projection_num_heads={num_heads} must divide embed_dim={embed_dim}")
+        if ff_dim <= 0:
+            ff_dim = 4 * embed_dim
+        self.ln_in = nn.LayerNorm(input_dim)
+        self.in_proj = nn.Linear(input_dim, embed_dim, bias=False)
+        layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers,
+                                             enable_nested_tensor=False)
+        self.ln_out = nn.LayerNorm(embed_dim)
+        nn.init.normal_(self.in_proj.weight, std=0.02)
+
+    def _forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.in_proj(self.ln_in(x)).unsqueeze(1)
+        h = self.encoder(h)
+        return self.ln_out(h.squeeze(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _flatten_leading(x, self._forward)
+
+
+def build_projection(input_dim: int, embed_dim: int, projection_type: str = "linear_probe",
+                     dropout: float = 0.0, num_layers: int = 1, num_heads: int = 8,
+                     ff_dim: int = 1024) -> nn.Module:
+    """Build the trainable head that maps backbone features into the shared space."""
+    if projection_type == "linear_probe":
+        proj = nn.Linear(input_dim, embed_dim, bias=False)
+        nn.init.normal_(proj.weight, std=0.02)
+        return proj
+    if projection_type == "mlp":
+        return ResidualMLPProjection(input_dim, embed_dim, dropout=dropout)
+    if projection_type == "transformer":
+        return TransformerProjection(input_dim, embed_dim, num_layers=num_layers,
+                                     num_heads=num_heads, ff_dim=ff_dim, dropout=dropout)
+    raise ValueError(f"unknown projection_type={projection_type!r}; "
+                     f"expected one of {PROJECTION_TYPES}")
+
+
 class DINOv2ImageTower(nn.Module):
-    """DINOv2 ViT backbone (frozen by default) + a trainable linear projection.
+    """DINOv2 ViT backbone (frozen by default) + a trainable projection head.
 
     ``forward`` returns the projected CLS token (precomputed input may also be CLS-only (B, D)); with ``return_patches=True`` it also
     returns the projected patch tokens (both in the shared embedding space).
@@ -515,7 +607,10 @@ class DINOv2ImageTower(nn.Module):
     """
 
     def __init__(self, model_name: str = "dinov2_vits14", embed_dim: int = 512,
-                 image_resolution: int = 224, freeze: bool = True, precomputed: bool = False):
+                 image_resolution: int = 224, freeze: bool = True, precomputed: bool = False,
+                 projection_type: str = "linear_probe", projection_dropout: float = 0.0,
+                 projection_num_layers: int = 1, projection_num_heads: int = 8,
+                 projection_ff_dim: int = 1024):
         super().__init__()
         self.precomputed = precomputed
         self.model_name = model_name
@@ -542,13 +637,24 @@ class DINOv2ImageTower(nn.Module):
             self.patch_size = int(self.backbone.patch_size)
 
         self.freeze = freeze
-        self.proj = nn.Linear(self.hidden_dim, embed_dim, bias=False)
-        nn.init.normal_(self.proj.weight, std=0.02)
+        self.proj = build_projection(
+            self.hidden_dim,
+            embed_dim,
+            projection_type=projection_type,
+            dropout=projection_dropout,
+            num_layers=projection_num_layers,
+            num_heads=projection_num_heads,
+            ff_dim=projection_ff_dim,
+        )
 
         if freeze and self.backbone is not None:
             for p in self.backbone.parameters():
                 p.requires_grad_(False)
             self.backbone.eval()
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return next(self.proj.parameters()).dtype
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -557,7 +663,7 @@ class DINOv2ImageTower(nn.Module):
         return self
 
     def forward(self, x: torch.Tensor, return_patches: bool = False):
-        dtype = self.proj.weight.dtype
+        dtype = self.dtype
 
         if self.precomputed:
             if x.ndim == 2:  # CLS-only features (B, D) from cls_only data loading
@@ -600,12 +706,12 @@ class DINOv2ImageTower(nn.Module):
             if x.ndim == 3:
                 return x[:, 0].detach()
             return x.detach()
-        feats = self.backbone.forward_features(x.type(self.proj.weight.dtype))
+        feats = self.backbone.forward_features(x.type(self.dtype))
         return feats["x_norm_clstoken"].detach()
 
 
 class QwenTextTower(nn.Module):
-    """Qwen3-Embedding backbone (frozen by default) + a trainable linear projection.
+    """Qwen3-Embedding backbone (frozen by default) + a trainable projection head.
 
     ``forward`` tokenises-free encodes a batch of texts; ``forward_emb`` instead projects the
     precomputed pooled (EOS) hidden states from ``preprocess/precompute_eos.py``.
@@ -614,7 +720,9 @@ class QwenTextTower(nn.Module):
     def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B", embed_dim: int = 512,
                  context_length: int = 256, pooling: str = "last_eos", freeze: bool = True,
                  pad_token_id: Optional[int] = None, cache_size: int = 50000,
-                 load_backbone: bool = True):
+                 load_backbone: bool = True, projection_type: str = "linear_probe",
+                 projection_dropout: float = 0.0, projection_num_layers: int = 1,
+                 projection_num_heads: int = 8, projection_ff_dim: int = 1024):
         super().__init__()
         self.load_backbone = load_backbone
         if load_backbone:
@@ -637,13 +745,24 @@ class QwenTextTower(nn.Module):
         self.cache_size = int(cache_size)
         self._pooled_cache: "OrderedDict[tuple, torch.Tensor]" = OrderedDict()
 
-        self.proj = nn.Linear(self.hidden_dim, embed_dim, bias=False)
-        nn.init.normal_(self.proj.weight, std=0.02)
+        self.proj = build_projection(
+            self.hidden_dim,
+            embed_dim,
+            projection_type=projection_type,
+            dropout=projection_dropout,
+            num_layers=projection_num_layers,
+            num_heads=projection_num_heads,
+            ff_dim=projection_ff_dim,
+        )
 
         if freeze and self.backbone is not None:
             for p in self.backbone.parameters():
                 p.requires_grad_(False)
             self.backbone.eval()
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return next(self.proj.parameters()).dtype
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -700,7 +819,7 @@ class QwenTextTower(nn.Module):
                 attention_mask = (input_ids != self.pad_token_id).long()
 
         pooled = self._pooled(input_ids, attention_mask)
-        return self.proj(pooled.to(self.proj.weight.dtype))
+        return self.proj(pooled.to(self.dtype))
 
     def forward_emb(self, pooled: torch.Tensor) -> torch.Tensor:
         """Project a precomputed pooled (EOS) hidden state, skipping the backbone.
@@ -712,7 +831,7 @@ class QwenTextTower(nn.Module):
         if pooled.ndim != 2 or pooled.shape[-1] != self.hidden_dim:
             raise ValueError(f"precomputed text embeddings must have shape (N, {self.hidden_dim}), "
                              f"got {tuple(pooled.shape)}")
-        return self.proj(pooled.to(self.proj.weight.dtype))
+        return self.proj(pooled.to(self.dtype))
 
     def forward_pre(self, input_ids: torch.Tensor,
                     attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -729,7 +848,9 @@ class CLIP(nn.Module):
     """Image/text towers with a shared embedding space.
 
     The image tower is DINOv2, the text tower is Qwen3-Embedding; each backbone output is
-    linearly projected into `embed_dim`. Backbones are frozen by default.
+    projected into `embed_dim` by an independently parameterised head selected with
+    ``projection_type`` (``linear_probe``, residual ``mlp`` or ``transformer``). Backbones are
+    frozen by default.
 
     With ``precomputed_image`` / ``precomputed_text`` the matching backbone is replaced by its
     precomputed outputs (DINOv2 tokens from ``generate_dino_emb.py`` / ``precompute_cls.py``,
@@ -753,6 +874,12 @@ class CLIP(nn.Module):
         load_text_backbone: bool = True,
         pad_token_id: Optional[int] = None,
         text_cache_size: int = 50000,
+        # projection head (independent weights for image and text)
+        projection_type: str = "linear_probe",  # linear_probe | mlp | transformer
+        projection_dropout: float = 0.0,
+        projection_num_layers: int = 1,  # transformer only
+        projection_num_heads: int = 8,   # transformer only (must divide embed_dim)
+        projection_ff_dim: int = 1024,   # transformer only; <=0 -> 4 * embed_dim
         # logit scale / bias (SigLIP uses scale=log(10) and a learnable bias=-10)
         logit_scale_init: float = float(np.log(1 / 0.07)),
         use_logit_bias: bool = False,
@@ -771,6 +898,11 @@ class CLIP(nn.Module):
             image_resolution=image_resolution,
             freeze=freeze_image_tower,
             precomputed=precomputed_image,
+            projection_type=projection_type,
+            projection_dropout=projection_dropout,
+            projection_num_layers=projection_num_layers,
+            projection_num_heads=projection_num_heads,
+            projection_ff_dim=projection_ff_dim,
         )
         self.transformer = QwenTextTower(
             model_name=text_model_name,
@@ -781,6 +913,11 @@ class CLIP(nn.Module):
             pad_token_id=pad_token_id,
             cache_size=text_cache_size,
             load_backbone=load_text_backbone,
+            projection_type=projection_type,
+            projection_dropout=projection_dropout,
+            projection_num_layers=projection_num_layers,
+            projection_num_heads=projection_num_heads,
+            projection_ff_dim=projection_ff_dim,
         )
 
         self.logit_scale = nn.Parameter(torch.ones([]) * logit_scale_init)
@@ -791,7 +928,7 @@ class CLIP(nn.Module):
 
     @property
     def dtype(self):
-        return self.visual.proj.weight.dtype
+        return self.visual.dtype
 
     def encode_image(self, image, return_patches: bool = False):
         return self.visual(image.type(self.dtype), return_patches=return_patches)

@@ -37,6 +37,7 @@ from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelChec
 from lightning.pytorch.cli import LightningCLI  # noqa: E402
 
 from loss import build_pair_loss  # noqa: E402
+from model import build_projection  # noqa: E402
 from sft.data import SFTDataModule  # noqa: E402
 from sft.loader import load_pretrained_clip  # noqa: E402
 
@@ -107,7 +108,7 @@ class SFTModel(pl.LightningModule):
         self._pair_loss = build_pair_loss(loss_type)
 
     def _init_projection_only(self, ckpt_path: str, features_dir: str) -> None:
-        """Load only the two linear probes (+ logit scale/bias) and cache the features on-device.
+        """Load the two projection heads (+ logit scale/bias) and cache features on-device.
 
         The frozen towers are not constructed at all, so startup is a checkpoint read instead of
         a DINOv2 hub download + Qwen3 0.6B ``from_pretrained``.
@@ -117,29 +118,35 @@ class SFTModel(pl.LightningModule):
         state = {k[len("model."):]: v for k, v in ckpt["state_dict"].items()
                  if k.startswith("model.")}
 
-        img_w = state["visual.proj.weight"].float()
-        txt_w = state["transformer.proj.weight"].float()
-        self.image_proj = nn.Linear(img_w.shape[1], img_w.shape[0], bias=False)
-        self.text_proj = nn.Linear(txt_w.shape[1], txt_w.shape[0], bias=False)
-        with torch.no_grad():
-            self.image_proj.weight.copy_(img_w)
-            self.text_proj.weight.copy_(txt_w)
+        root = Path(features_dir)
+        img = np.load(root / "image.npy", mmap_mode="r")
+        txt = np.load(root / "text.npy", mmap_mode="r")
+        if img.shape[0] != txt.shape[0]:
+            raise ValueError(f"image/text feature rows differ: {img.shape[0]} vs {txt.shape[0]}")
+
+        projection_type = hp.get("projection_type", "linear_probe")
+        head_kwargs = dict(
+            projection_type=projection_type,
+            dropout=float(hp.get("projection_dropout", 0.0)),
+            num_layers=int(hp.get("projection_num_layers", 1)),
+            num_heads=int(hp.get("projection_num_heads", 8)),
+            ff_dim=int(hp.get("projection_ff_dim", 1024)),
+        )
+        embed_dim = int(hp.get("embed_dim", 512))
+        self.image_proj = build_projection(img.shape[1], embed_dim, **head_kwargs)
+        self.text_proj = build_projection(txt.shape[1], embed_dim, **head_kwargs)
+        img_state = {k[len("visual.proj."):]: v for k, v in state.items()
+                     if k.startswith("visual.proj.")}
+        txt_state = {k[len("transformer.proj."):]: v for k, v in state.items()
+                     if k.startswith("transformer.proj.")}
+        self.image_proj.load_state_dict(img_state)
+        self.text_proj.load_state_dict(txt_state)
 
         self._logit_scale = nn.Parameter(state["logit_scale"].float().reshape(()).clone())
         if state.get("logit_bias") is not None:
             self._logit_bias = nn.Parameter(state["logit_bias"].float().reshape(()).clone())
         else:
             self.register_parameter("_logit_bias", None)
-
-        root = Path(features_dir)
-        img = np.load(root / "image.npy", mmap_mode="r")
-        txt = np.load(root / "text.npy", mmap_mode="r")
-        if img.shape[1] != img_w.shape[1] or txt.shape[1] != txt_w.shape[1]:
-            raise ValueError(
-                f"feature dims image={img.shape} text={txt.shape} do not match checkpoint "
-                f"projections ({tuple(img_w.shape)}, {tuple(txt_w.shape)})")
-        if img.shape[0] != txt.shape[0]:
-            raise ValueError(f"image/text feature rows differ: {img.shape[0]} vs {txt.shape[0]}")
         # Persistent=False: these buffers are data, never part of the checkpoint.
         self.register_buffer("_image_feats", torch.from_numpy(np.array(img)), persistent=False)
         self.register_buffer("_text_feats", torch.from_numpy(np.array(txt)), persistent=False)

@@ -72,8 +72,14 @@ def load_pretrained_clip(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    embed_dim = int(hp.get("embed_dim", 512))
     model = CLIP(
-        embed_dim=int(hp.get("embed_dim", 512)),
+        embed_dim=embed_dim,
+        projection_type=hp.get("projection_type", "linear_probe"),
+        projection_dropout=float(hp.get("projection_dropout", 0.0)),
+        projection_num_layers=int(hp.get("projection_num_layers", 1)),
+        projection_num_heads=int(hp.get("projection_num_heads", 8)),
+        projection_ff_dim=int(hp.get("projection_ff_dim", 1024)),
         image_resolution=res,
         text_model_name=text_name,
         image_model_name=image_name,
@@ -100,8 +106,8 @@ def load_pretrained_clip(
 
     if verbose:
         print(f"[sft.loader] loaded {ckpt_path}")
-        print(f"  embed_dim={model.visual.proj.out_features} text={text_name} image={image_name} "
-              f"logit_bias={use_logit_bias}")
+        print(f"  embed_dim={embed_dim} projection={hp.get('projection_type', 'linear_probe')} "
+              f"text={text_name} image={image_name} logit_bias={use_logit_bias}")
         print(f"  matched keys={len(state) - len(unexpected)}  "
               f"missing(non-backbone)={len(other_missing)}  "
               f"missing(backbone, reloaded from hub)={len(backbone_missing)}  "

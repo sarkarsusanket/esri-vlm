@@ -47,6 +47,11 @@ class CLIPLightningModule(pl.LightningModule):
                                                     # True -> load it (needed to encode raw text, e.g. eval)
         # model architecture
         embed_dim: int = 512,
+        projection_type: Literal["linear_probe", "mlp", "transformer"] = "linear_probe",
+        projection_dropout: float = 0.0,
+        projection_num_layers: int = 1,  # transformer only
+        projection_num_heads: int = 8,   # transformer only (must divide embed_dim)
+        projection_ff_dim: int = 1024,   # transformer only; <=0 -> 4 * embed_dim
         image_resolution: int = 224,
         vision_patch_size: int = 14,
         context_length: int = 256,
@@ -128,6 +133,11 @@ class CLIPLightningModule(pl.LightningModule):
             load_text_backbone=needs_text_backbone,
             pad_token_id=self.tokenizer.pad_token_id,
             text_cache_size=text_cache_size,
+            projection_type=projection_type,
+            projection_dropout=projection_dropout,
+            projection_num_layers=projection_num_layers,
+            projection_num_heads=projection_num_heads,
+            projection_ff_dim=projection_ff_dim,
             **logit_kwargs,
         )
         # print(self.model)
@@ -500,10 +510,17 @@ class CLIPLightningModule(pl.LightningModule):
             eps=1e-6,
         )
 
+        total = self.trainer.estimated_stepping_batches
+        if not isinstance(total, (int, float)) or not math.isfinite(total) or total <= 0:
+            total = self.warmup_steps + 100_000
+        total = int(total)
+        min_ratio = 0.02
+
         def lr_lambda(step):
             if step < self.warmup_steps:
                 return step / max(1, self.warmup_steps)
-            return max(0.0, 1.0 - (step - self.warmup_steps) / 100000)
+            p = min(1.0, (step - self.warmup_steps) / max(1, total - self.warmup_steps))
+            return min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * p))
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 

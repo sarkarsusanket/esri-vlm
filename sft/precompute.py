@@ -116,8 +116,11 @@ def embed_text(texts: List[str], tokenizer, model, device, context_length: int) 
            if k in ("input_ids", "attention_mask")}
     with torch.inference_mode():
         hidden = model(**enc).last_hidden_state
-        last = enc["attention_mask"].sum(dim=1) - 1
-        e = hidden[torch.arange(hidden.shape[0], device=device), last]
+        if tokenizer.padding_side == "left":
+            e = hidden[:, -1]
+        else:
+            last = enc["attention_mask"].sum(dim=1) - 1
+            e = hidden[torch.arange(hidden.shape[0], device=device), last]
     return e.float().cpu().numpy().astype(np.float16, copy=False)
 
 

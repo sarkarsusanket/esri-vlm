@@ -2,7 +2,7 @@
 Image-Text Cross-Modal Evaluation Script (Class-based Folders + Parquet Caption Datasets with MRL Support)
 
 Usage:
-    python eval/eval.py --ckpt_path /home/susanket/esri-vlm/esri-vlm/ddvi5ics/checkpoints/epoch=3-step=23628.ckpt --output /home/susanket/esri-vlm/esri-vlm/ddvi5ics/eval.html --mrl_dims 64 128 256
+    python eval/eval.py --ckpt_path /home/susanket/esri-vlm/esri-vlm/ddvi5ics/checkpoints/epoch=51-step=307164.ckpt --output /home/susanket/esri-vlm/esri-vlm/ddvi5ics/eval.html --mrl_dims 64 128 256
 """
 import os
 os.environ.setdefault('CUDA_VISIBLE_DEVICES', "1,2")
