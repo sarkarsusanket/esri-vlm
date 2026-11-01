@@ -9,7 +9,7 @@ trainer:
   logger: null
   callbacks: null
   fast_dev_run: false
-  max_epochs: 100
+  max_epochs: 500
   min_epochs: null
   max_steps: -1
   min_steps: null
@@ -123,7 +123,7 @@ init_ckpt_path: null
 use_wandb: true
 wandb_project: esri-vlm
 wandb_entity: null
-wandb_tags: dinov2,qwen30.6,siglip,MRL,relationalloss,multilingual,regionloss,keywordloss
+wandb_tags: dinov2,qwen30.6,siglip,MRL,relationalloss,multilingual,regionloss,keywordloss,transformer
 wandb_offline: false
 wandb_every_n_steps: 100
 optimizer: null

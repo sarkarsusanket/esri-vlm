@@ -2,7 +2,7 @@
 use_wandb: true
 wandb_project: "esri-vlm"
 wandb_entity: null            # set your W&B team/user if needed
-wandb_tags:  "dinov2,qwen30.6,siglip,MRL,relationalloss,multilingual,regionloss,keywordloss"              # e.g. "mrl,dinov2,siglip"
+wandb_tags:  "dinov2,qwen30.6,siglip,MRL,relationalloss,multilingual,regionloss,keywordloss,transformer"              # e.g. "mrl,dinov2,siglip"
 wandb_offline: false          # true -> log locally, sync later with `wandb sync`
 wandb_every_n_steps: 100       # sampling cadence for GPU/CPU/RAM metrics
 
@@ -115,6 +115,6 @@ data:
 trainer:
   accelerator: auto             # auto -> all visible CUDA devices (do NOT pin CUDA_VISIBLE_DEVICES here)
   devices: auto                 # auto -> every GPU Lightning can see, DDP across them
-  max_epochs: 100
+  max_epochs: 500
   precision:  bf16-mixed
   accumulate_grad_batches: 1

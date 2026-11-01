@@ -66,10 +66,16 @@ def load_sft_clip(ckpt: dict, device: torch.device):
     if any(k.startswith("model.") for k in state):  # SFT ran with real backbones
         sub = {k[len("model."):]: v for k, v in state.items() if k.startswith("model.")}
         clip.load_state_dict(sub, strict=False)
-    else:  # precomputed SFT: transfer the trained probes into the real towers
+    else:  # precomputed SFT: transfer the trained projection heads into the real towers
+        img_state = {k[len("image_proj."):]: v for k, v in state.items()
+                     if k.startswith("image_proj.")}
+        txt_state = {k[len("text_proj."):]: v for k, v in state.items()
+                     if k.startswith("text_proj.")}
+        if not img_state or not txt_state:
+            raise RuntimeError("precomputed SFT checkpoint is missing image_proj/text_proj weights")
+        clip.visual.proj.load_state_dict(img_state)
+        clip.transformer.proj.load_state_dict(txt_state)
         with torch.no_grad():
-            clip.visual.proj.weight.copy_(state["image_proj.weight"])
-            clip.transformer.proj.weight.copy_(state["text_proj.weight"])
             clip.logit_scale.copy_(state["_logit_scale"].reshape(()))
             if clip.logit_bias is not None and state.get("_logit_bias") is not None:
                 clip.logit_bias.copy_(state["_logit_bias"].reshape(()))

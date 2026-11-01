@@ -14,10 +14,7 @@ magnitude faster and uses no backbone memory.
 
 Usage:
     cd /home/susanket/esri-vlm
-    python sft/precompute.py \
-        --data_dir /data/susanket/vlm/sft_reshard \
-        --output_dir /data/susanket/vlm/sft_features \
-        --batch_size 256
+    python sft/precompute.py --data_dir /data/susanket/vlm/sft2 --output_dir /data/susanket/vlm/sft_feat2 
 
 Point ``data.data_dir`` at a directory containing training parquet(s) only; do not mix the test
 split in here. Precomputed features use the same deterministic resize as the pretraining DINOv2
