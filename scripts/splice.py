@@ -28,6 +28,9 @@ Outputs (in --out_dir)
     concepts.txt               vocabulary, column order of weights_sparse.npz
     concept_histogram.csv      dataset-level concept summary (sum / mean weight, #images)
     image_mean.pt              image mean used for centering (reuse via --image_mean)
+
+
+python /home/susanket/esri-vlm/scripts/splice.py --parquet /data/susanket/vlm/images3/image-00.parquet --out_dir /data/susanket/vlm/splice/ --vocab_file /data/susanket/vlm/splice/vocab_out/vocab_unigrams.txt
 """
 import os
 os.environ.setdefault('CUDA_VISIBLE_DEVICES', "3")

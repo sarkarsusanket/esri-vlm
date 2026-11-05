@@ -2,7 +2,7 @@
 Visualize SpLiCE decompositions like Fig. 2 of the paper: image on the left, non-zero concepts
 with their weights as horizontal bars on the right.
 
-    python viz_splice.py --parquet image.parquet --out_dir splice_out                  # first 6 images
+    python /home/susanket/esri-vlm/scripts/splice-viz.py --parquet /data/susanket/vlm/images3/image-00.parquet --out_dir /data/susanket/vlm/splice/ --save /data/susanket/vlm/splice/grid3.png                  # first 6 images
     python viz_splice.py --parquet image.parquet --idx 3 17 42 --topk 12               # specific rows
     python viz_splice.py --parquet image.parquet --random 8 --save grid.png            # random sample
     python viz_splice.py --parquet image.parquet --idx 5 --show                        # interactive window
@@ -64,7 +64,8 @@ def main():
     outer = fig.add_gridspec(nrows, ncols, hspace=0.35, wspace=0.15)
 
     for k, r in enumerate(rows):
-        inner = outer[k // ncols, k % ncols].subgridspec(1, 2, width_ratios=[1, 1.25], wspace=0.05)
+        # Change wspace here (e.g., from 0.08 to 0.18)
+        inner = outer[k // ncols, k % ncols].subgridspec(1, 2, width_ratios=[1, 1.1], wspace=0.18)
         ax_i, ax_b = fig.add_subplot(inner[0]), fig.add_subplot(inner[1])
 
         img = Image.open(io.BytesIO(to_bytes(imgs.iloc[r][args.image_col]))).convert("RGB")
@@ -92,7 +93,7 @@ def main():
             wts = np.asarray(row["weights"])[:args.topk]
 
         y = np.arange(len(names))
-        ax_b.barh(y, wts, color="#4c72b0")
+        ax_b.barh(y, wts, color="#4e64b6")
         ax_b.set_yticks(y)
         ax_b.set_yticklabels(names, fontsize=8)
         ax_b.invert_yaxis()

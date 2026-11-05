@@ -14,7 +14,7 @@ magnitude faster and uses no backbone memory.
 
 Usage:
     cd /home/susanket/esri-vlm
-    python sft/precompute.py --data_dir /data/susanket/vlm/sft2 --output_dir /data/susanket/vlm/sft_feat2 
+    python sft/precompute.py --data_dir /data/susanket/vlm/sft/ --output_dir /data/susanket/vlm/sft_feat/ 
 
 Point ``data.data_dir`` at a directory containing training parquet(s) only; do not mix the test
 split in here. Precomputed features use the same deterministic resize as the pretraining DINOv2
@@ -23,7 +23,7 @@ extraction, so random crop / flip augmentation is no longer applied during train
 from __future__ import annotations
 
 import os
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1,2")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "3")
 
 import argparse
 import io
@@ -144,7 +144,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", required=True, help="directory with training *.parquet")
     ap.add_argument("--output_dir", required=True)
-    ap.add_argument("--image_col", default="image_bytes")
+    ap.add_argument("--image_col", default="image")
     ap.add_argument("--caption_col", default=None)
     ap.add_argument("--image_path_col", default=None)
     ap.add_argument("--image_root", default=None)

@@ -43,7 +43,7 @@ trainer:
   enable_autolog_hparams: true
   model_registry: null
 model:
-  ckpt_path: /home/susanket/esri-vlm/dujvcqom/checkpoints/epoch=39-step=236280.ckpt
+  ckpt_path: /home/susanket/esri-vlm/lax2unwh/checkpoints/epoch=142-step=844701.ckpt
   image_resolution: null
   context_length: null
   loss_type: siglip
