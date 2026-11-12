@@ -103,7 +103,7 @@ class ShardIndex:
     def __init__(self, root: str, image_col: str = "image_bytes", use_masks: bool = False,
                  mask_subdir: str = "masks", row_group_cache: int = 4,
                  precomputed: bool = False, verbose: bool = True, cls_only: bool = False,
-                 precomputed_text: bool = False):
+                 precomputed_text: bool = False, zoom_filter: Optional[int] = None):
         if cls_only and not precomputed:
             raise ValueError("cls_only=True requires precomputed=True")
         if cls_only and use_masks:
@@ -115,6 +115,7 @@ class ShardIndex:
         self.precomputed = precomputed
         self.cls_only = cls_only
         self.precomputed_text = precomputed_text
+        self.zoom_filter = zoom_filter
         self._cls: Dict[int, np.ndarray] = {}  # lazily memory-mapped cls-xx.npy per shard
         self.row_group_cache = row_group_cache
         self.shards: List[ShardInfo] = []
@@ -127,7 +128,7 @@ class ShardIndex:
         if not image_files:
             raise FileNotFoundError(f"no image-*.parquet found in {self.root}")
 
-        n_missing_img = n_empty = n_masked = n_missing_emb = n_missing_txt_emb = 0
+        n_missing_img = n_empty = n_masked = n_missing_emb = n_missing_txt_emb = n_wrong_zoom = 0
         for p in image_files:
             name = p.stem[len("image-"):]
             cap_path = self.root / f"caption-{name}.parquet"
@@ -136,10 +137,16 @@ class ShardIndex:
                 continue
 
             pf = pq.ParquetFile(p)
-            fn_col = pf.read(columns=["file_name"]).column("file_name").to_pylist()
+            img_cols = ["file_name"] + (["zoom"] if zoom_filter is not None else [])
+            img_tbl = pf.read(columns=img_cols)
+            fn_col = img_tbl.column("file_name").to_pylist()
             row_of: Dict[str, int] = {}
             for r, fn in enumerate(fn_col):
                 row_of.setdefault(str(fn), r)
+            allowed: Optional[Set[str]] = None
+            if zoom_filter is not None:
+                zoom_col = img_tbl.column("zoom").to_pylist()
+                allowed = {str(fn) for fn, z in zip(fn_col, zoom_col) if z is not None and int(z) == zoom_filter}
             rg_ends = np.cumsum([pf.metadata.row_group(i).num_rows for i in range(pf.num_row_groups)])
             if verbose and rg_ends.size and int(np.diff(np.r_[0, rg_ends]).max()) > 4096:
                 warnings.warn(f"{p.name}: row groups have >4096 rows; random access re-reads a whole "
@@ -202,6 +209,9 @@ class ShardIndex:
                 if row is None:
                     n_missing_img += 1
                     continue
+                if allowed is not None and fn not in allowed:
+                    n_wrong_zoom += 1
+                    continue
                 if precomputed and Path(fn).stem not in emb_stems:
                     n_missing_emb += 1
                     continue
@@ -225,7 +235,8 @@ class ShardIndex:
                   + (f", {n_missing_emb} without precomputed embedding" if precomputed else "") + ")"
                   + (f", {n_missing_txt_emb} without precomputed summary embedding"
                      if precomputed_text else "")
-                  + (f"; {n_masked} with mask entries" if use_masks else ""))
+                  + (f"; {n_masked} with mask entries" if use_masks else "")
+                  + (f"; {n_wrong_zoom} outside zoom={zoom_filter}" if zoom_filter is not None else ""))
             if precomputed and n_missing_emb:
                 print(f"[ShardIndex] dropped samples get embeddings once preprocess/generate_dino_emb.py "
                       f"finishes; re-instantiate the index to pick them up")

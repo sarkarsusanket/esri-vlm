@@ -90,6 +90,8 @@ data:
   num_workers: 30
   val_fraction: 0.1
   split_seed: 0
+  zoom_filter: null            # only keep records whose image-xx.parquet `zoom` column equals this
+                               # (e.g. 18 for a zoom-18-only ablation); null -> no zoom filtering
   # dense captions / hard negatives
   dense_max_sentences: 5
   hard_neg_per_image: 4        # sentences per image that get a negative twin (the cf_dense_caption

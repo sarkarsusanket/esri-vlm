@@ -1,0 +1,120 @@
+Seed set to 0
+Using bfloat16 Automatic Mixed Precision (AMP)
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+💡 Tip: For seamless cloud logging and experiment tracking, try installing [litlogger](https://pypi.org/project/litlogger/) to enable LitLogger, which logs metrics and artifacts automatically to the Lightning Experiments platform.
+wandb: WARNING The anonymous setting has no effect and will be removed in a future version.
+wandb: [wandb.login()] Loaded credentials for https://api.forge.coreweave.com from /home/susanket/.netrc.
+wandb: Currently logged in as: susanketsarkar14836 (susanketsarkar14836-esri) to https://api.forge.coreweave.com. Use `wandb login --relogin` to force relogin
+wandb: setting up run mkb44ydu
+wandb: Tracking run with wandb version 0.31.0
+wandb: Run data is saved locally in /home/susanket/esri-vlm/ablations/zoom18/wandb/run-20261107_062349-mkb44ydu
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run CLIP_2026-11-07_06:23:48
+wandb: ⭐️ View project at https://forge.coreweave.com/wandb/susanketsarkar14836-esri/esri-vlm-ablations
+wandb: 🚀 View run at https://forge.coreweave.com/wandb/susanketsarkar14836-esri/esri-vlm-ablations/runs/mkb44ydu
+💡 Tip: For seamless cloud uploads and versioning, try installing [litmodels](https://pypi.org/project/litmodels/) to enable LitModelCheckpoint, which syncs automatically with the Lightning model registry.
+/home/susanket/esri-vlm/src/shards.py:152: UserWarning: image-00.parquet: row groups have >4096 rows; random access re-reads a whole row group per cache miss. Re-write with ~256-1024 rows/group for speed.
+  warnings.warn(f"{p.name}: row groups have >4096 rows; random access re-reads a whole "
+/home/susanket/esri-vlm/src/shards.py:152: UserWarning: image-01.parquet: row groups have >4096 rows; random access re-reads a whole row group per cache miss. Re-write with ~256-1024 rows/group for speed.
+  warnings.warn(f"{p.name}: row groups have >4096 rows; random access re-reads a whole "
+/home/susanket/esri-vlm/src/shards.py:152: UserWarning: image-02.parquet: row groups have >4096 rows; random access re-reads a whole row group per cache miss. Re-write with ~256-1024 rows/group for speed.
+  warnings.warn(f"{p.name}: row groups have >4096 rows; random access re-reads a whole "
+/home/susanket/esri-vlm/src/shards.py:152: UserWarning: image-03.parquet: row groups have >4096 rows; random access re-reads a whole row group per cache miss. Re-write with ~256-1024 rows/group for speed.
+  warnings.warn(f"{p.name}: row groups have >4096 rows; random access re-reads a whole "
+/home/susanket/esri-vlm/src/shards.py:152: UserWarning: image-04.parquet: row groups have >4096 rows; random access re-reads a whole row group per cache miss. Re-write with ~256-1024 rows/group for speed.
+  warnings.warn(f"{p.name}: row groups have >4096 rows; random access re-reads a whole "
+Seed set to 0
+Using bfloat16 Automatic Mixed Precision (AMP)
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+💡 Tip: For seamless cloud logging and experiment tracking, try installing [litlogger](https://pypi.org/project/litlogger/) to enable LitLogger, which logs metrics and artifacts automatically to the Lightning Experiments platform.
+wandb: WARNING The anonymous setting has no effect and will be removed in a future version.
+wandb: [wandb.login()] Loaded credentials for https://api.forge.coreweave.com from /home/susanket/.netrc.
+wandb: Currently logged in as: susanketsarkar14836 (susanketsarkar14836-esri) to https://api.forge.coreweave.com. Use `wandb login --relogin` to force relogin
+wandb: setting up run 9xo1jv4a
+wandb: Tracking run with wandb version 0.31.0
+wandb: Run data is saved locally in /home/susanket/esri-vlm/ablations/zoom18/wandb/run-20261107_062606-9xo1jv4a
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run CLIP_2026-11-07_06:26:06
+wandb: ⭐️ View project at https://forge.coreweave.com/wandb/susanketsarkar14836-esri/esri-vlm-ablations
+wandb: 🚀 View run at https://forge.coreweave.com/wandb/susanketsarkar14836-esri/esri-vlm-ablations/runs/9xo1jv4a
+💡 Tip: For seamless cloud uploads and versioning, try installing [litmodels](https://pypi.org/project/litmodels/) to enable LitModelCheckpoint, which syncs automatically with the Lightning model registry.
+/home/susanket/esri-vlm/src/shards.py:152: UserWarning: image-00.parquet: row groups have >4096 rows; random access re-reads a whole row group per cache miss. Re-write with ~256-1024 rows/group for speed.
+  warnings.warn(f"{p.name}: row groups have >4096 rows; random access re-reads a whole "
+/home/susanket/esri-vlm/src/shards.py:152: UserWarning: image-01.parquet: row groups have >4096 rows; random access re-reads a whole row group per cache miss. Re-write with ~256-1024 rows/group for speed.
+  warnings.warn(f"{p.name}: row groups have >4096 rows; random access re-reads a whole "
+/home/susanket/esri-vlm/src/shards.py:152: UserWarning: image-02.parquet: row groups have >4096 rows; random access re-reads a whole row group per cache miss. Re-write with ~256-1024 rows/group for speed.
+  warnings.warn(f"{p.name}: row groups have >4096 rows; random access re-reads a whole "
+/home/susanket/esri-vlm/src/shards.py:152: UserWarning: image-03.parquet: row groups have >4096 rows; random access re-reads a whole row group per cache miss. Re-write with ~256-1024 rows/group for speed.
+  warnings.warn(f"{p.name}: row groups have >4096 rows; random access re-reads a whole "
+/home/susanket/esri-vlm/src/shards.py:152: UserWarning: image-04.parquet: row groups have >4096 rows; random access re-reads a whole row group per cache miss. Re-write with ~256-1024 rows/group for speed.
+  warnings.warn(f"{p.name}: row groups have >4096 rows; random access re-reads a whole "
+/home/susanket/esri-vlm/src/shards.py:152: UserWarning: image-05.parquet: row groups have >4096 rows; random access re-reads a whole row group per cache miss. Re-write with ~256-1024 rows/group for speed.
+  warnings.warn(f"{p.name}: row groups have >4096 rows; random access re-reads a whole "
+/home/susanket/esri-vlm/src/shards.py:152: UserWarning: image-06.parquet: row groups have >4096 rows; random access re-reads a whole row group per cache miss. Re-write with ~256-1024 rows/group for speed.
+  warnings.warn(f"{p.name}: row groups have >4096 rows; random access re-reads a whole "
+/home/susanket/esri-vlm/src/shards.py:152: UserWarning: image-07.parquet: row groups have >4096 rows; random access re-reads a whole row group per cache miss. Re-write with ~256-1024 rows/group for speed.
+  warnings.warn(f"{p.name}: row groups have >4096 rows; random access re-reads a whole "
+/home/susanket/esri-vlm/src/shards.py:152: UserWarning: image-08.parquet: row groups have >4096 rows; random access re-reads a whole row group per cache miss. Re-write with ~256-1024 rows/group for speed.
+  warnings.warn(f"{p.name}: row groups have >4096 rows; random access re-reads a whole "
+/home/susanket/esri-vlm/src/shards.py:152: UserWarning: image-09.parquet: row groups have >4096 rows; random access re-reads a whole row group per cache miss. Re-write with ~256-1024 rows/group for speed.
+  warnings.warn(f"{p.name}: row groups have >4096 rows; random access re-reads a whole "
+/home/susanket/esri-vlm/src/shards.py:152: UserWarning: image-10.parquet: row groups have >4096 rows; random access re-reads a whole row group per cache miss. Re-write with ~256-1024 rows/group for speed.
+  warnings.warn(f"{p.name}: row groups have >4096 rows; random access re-reads a whole "
+/home/susanket/esri-vlm/src/shards.py:152: UserWarning: image-11.parquet: row groups have >4096 rows; random access re-reads a whole row group per cache miss. Re-write with ~256-1024 rows/group for speed.
+  warnings.warn(f"{p.name}: row groups have >4096 rows; random access re-reads a whole "
+/home/susanket/esri-vlm/src/shards.py:152: UserWarning: image-12.parquet: row groups have >4096 rows; random access re-reads a whole row group per cache miss. Re-write with ~256-1024 rows/group for speed.
+  warnings.warn(f"{p.name}: row groups have >4096 rows; random access re-reads a whole "
+/home/susanket/esri-vlm/src/shards.py:152: UserWarning: image-13.parquet: row groups have >4096 rows; random access re-reads a whole row group per cache miss. Re-write with ~256-1024 rows/group for speed.
+  warnings.warn(f"{p.name}: row groups have >4096 rows; random access re-reads a whole "
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [1]
+Loading `train_dataloader` to estimate number of stepping batches.
+/data/susanket/conda/lib/python3.13/site-packages/lightning/pytorch/utilities/_pytree.py:21: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
+[ShardIndex] 14 shards, 6409692 samples (dropped: 0 without image, 0 without summary, 0 without precomputed embedding), 19491 without precomputed summary embedding; 1468177 with mask entries; 7068260 outside zoom=18
+[ShardIndex] dropped samples get text embeddings once preprocess/precompute_eos.py finishes; re-instantiate the index to pick them up
+/data/susanket/conda/lib/python3.13/site-packages/lightning/pytorch/utilities/model_summary/model_summary.py:242: Precision bf16-mixed is not supported by the model summary.  Estimated model size in MB will not be accurate. Using 32 bits instead.
+┏━━━┳━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━┓
+┃   ┃ Name             ┃ Type                        ┃ Params ┃ Mode  ┃ FLOPs ┃
+┡━━━╇━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━┩
+│ 0 │ model            │ CLIP                        │  627 K │ train │     0 │
+│ 1 │ pair_loss        │ MultiPositiveSigLIPLoss     │      0 │ train │     0 │
+│ 2 │ counter_loss     │ CounterfactualMarginLoss    │      0 │ train │     0 │
+│ 3 │ threshold_loss   │ ThresholdLoss               │      0 │ train │     0 │
+│ 4 │ uniform_loss     │ UniformityLoss              │      0 │ train │     0 │
+│ 5 │ silhouette_loss  │ SilhouetteLoss              │      0 │ train │     0 │
+│ 6 │ relational_loss  │ RelationalLoss              │      0 │ train │     0 │
+│ 7 │ consistency_loss │ CrossLingualConsistencyLoss │      0 │ train │     0 │
+└───┴──────────────────┴─────────────────────────────┴────────┴───────┴───────┘
+Trainable params: 627 K                                                         
+Non-trainable params: 0                                                         
+Total params: 627 K                                                             
+Total estimated model params size (MB): 2.510                                   
+Modules in train mode: 24                                                       
+Modules in eval mode: 0                                                         
+Total FLOPs: 0                                                                  
+/data/susanket/conda/lib/python3.13/site-packages/lightning/pytorch/utilities/_pytree.py:21: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
+Transient error Service Unavailable encountered while exporting metrics batch, retrying in 0.85s.
+Transient error Service Unavailable encountered while exporting metrics batch, retrying in 1.13s.
+Transient error Service Unavailable encountered while exporting metrics batch, retrying in 1.13s.
+Transient error Service Unavailable encountered while exporting metrics batch, retrying in 1.19s.
+Transient error Service Unavailable encountered while exporting metrics batch, retrying in 1.16s.
+Transient error Service Unavailable encountered while exporting metrics batch, retrying in 1.14s.
+Transient error Service Unavailable encountered while exporting metrics batch, retrying in 0.90s.
+Transient error Service Unavailable encountered while exporting metrics batch, retrying in 0.85s.
+Transient error Service Unavailable encountered while exporting metrics batch, retrying in 0.96s.
+Transient error Service Unavailable encountered while exporting metrics batch, retrying in 1.00s.
+Transient error Service Unavailable encountered while exporting metrics batch, retrying in 0.92s.
+Transient error Service Unavailable encountered while exporting metrics batch, retrying in 0.81s.
+Transient error Service Unavailable encountered while exporting metrics batch, retrying in 0.83s.
+Transient error Service Unavailable encountered while exporting metrics batch, retrying in 1.04s.
+`Trainer.fit` stopped: `max_epochs=30` reached.
+Epoch 29/29 ━━━━━━━━━━━━━━━ 5633/5633 0:19:18 •       5.27it/s v_num: jv4a      
+                                      0:00:00                  train_loss_step: 
+                                                               62.799 val_loss: 
+                                                               64.703           
+                                                               train_loss_epoch:
+                                                               64.275           
+[1;34mwandb[0m: 
+[1;34mwandb[0m: 🚀 View run [33mCLIP_2026-11-07_06:26:06[0m at: [34mhttps://forge.coreweave.com/wandb/susanketsarkar14836-esri/esri-vlm-ablations/runs/9xo1jv4a[0m
+[1;34mwandb[0m: Find logs at: [1;35mablations/zoom18/wandb/run-20261107_062606-9xo1jv4a/logs[0m

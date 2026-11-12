@@ -404,6 +404,7 @@ class CLIPDataModule(pl.LightningDataModule):
         num_workers: int = 4,
         val_fraction: float = 0.1,
         split_seed: int = 0,
+        zoom_filter: Optional[int] = None,
         # linked from the model section in main.py (do not set them under `data:`)
         image_resolution: int = 224,
         patch_size: int = 32,
@@ -463,7 +464,8 @@ class CLIPDataModule(pl.LightningDataModule):
                                 precomputed=h.precomputed_image,
                                 # only the CLS token is used unless the region loss needs patches
                                 cls_only=h.precomputed_image and not h.use_masks,
-                                precomputed_text=h.precomputed_text)
+                                precomputed_text=h.precomputed_text,
+                                zoom_filter=h.zoom_filter)
 
         perm = np.random.RandomState(h.split_seed).permutation(len(self.index))
         n_val = int(len(perm) * h.val_fraction)
